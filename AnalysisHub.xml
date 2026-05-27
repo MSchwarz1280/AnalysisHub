@@ -1,0 +1,192 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  AnalysisHub ACT Extension
+  Compatible: ANSYS Workbench 2024 R2 (v242) and later
+  Purpose: Centralized Analysis Repository Manager in the Project Schematic
+-->
+<extension version="1" name="AnalysisHub">
+
+  <!-- Unique GUID for this extension - do not change after deployment -->
+  <guid shortid="AnalysisHub">4a65b67b-e813-4566-86bd-d288a00303d4</guid>
+
+  <!-- Main IronPython script (loaded at startup) -->
+  <script src="main.py" />
+
+  <!-- Workbench Project Schematic toolbar entry -->
+  <interface context="Project">
+    <images>images</images>
+
+    <toolbar name="AnalysisHubToolbar" caption="Analysis Hub">
+      <entry name="OpenRepository" caption="Analysis Repository" icon="hub_toolbar">
+        <callbacks>
+          <onclick>toolbar_open_repository</onclick>
+        </callbacks>
+      </entry>
+    </toolbar>
+  </interface>
+
+  <!--
+    WORKFLOW: Defines the "Analysis Hub" system that appears in the Workbench
+    Toolbox under "ACT Custom Workflows" -> "Analysis Hub".
+    Drag it onto the Project Schematic to create an Analysis Hub instance.
+  -->
+  <workflow name="AnalysisHub" context="Project" version="1">
+
+    <!-- ================================================================
+         TASKS  (the individual cells within the system on the schematic)
+         ================================================================ -->
+    <tasks>
+
+      <!--
+        "Repository" task — the main Links cell of the Analysis Hub system.
+        Right-click -> Edit opens the full Repository Manager UI.
+        onstatus drives the cell state icon (green/yellow/red).
+      -->
+      <task name="RepositoryTask"
+            caption="Repository"
+            icon="hub_cell"
+            version="1"
+            enableGenericTransfer="False">
+
+        <callbacks>
+          <oninitialize>task_initialize</oninitialize>
+          <onedit>task_edit</onedit>
+          <onupdate>task_update</onupdate>
+          <onrefresh>task_refresh</onrefresh>
+          <onreset>task_reset</onreset>
+          <onstatus>task_status</onstatus>
+          <onreport>task_report</onreport>
+          <ondelete>task_delete</ondelete>
+        </callbacks>
+
+        <!-- Right-click context menu entries -->
+        <contextmenus>
+          <entry name="EditRepository"
+                 caption="Edit Repository..."
+                 icon="hub_cell"
+                 priority="1"
+                 type="ContextMenuEntry">
+            <callbacks>
+              <onclick>task_edit</onclick>
+            </callbacks>
+          </entry>
+
+          <entry name="RefreshRepository"
+                 caption="Refresh Repository"
+                 icon="hub_toolbar"
+                 priority="2"
+                 type="ContextMenuEntry">
+            <callbacks>
+              <onclick>context_refresh</onclick>
+            </callbacks>
+          </entry>
+
+          <entry name="HealthCheck"
+                 caption="Run Health Check"
+                 priority="3"
+                 type="ContextMenuEntry">
+            <callbacks>
+              <onclick>context_health_check</onclick>
+            </callbacks>
+          </entry>
+        </contextmenus>
+
+        <!-- Persistent properties stored in the project -->
+        <propertygroup name="ProjectInfo" caption="Project Information">
+          <property name="ProjectTitle"
+                    caption="Project Title"
+                    control="text"
+                    default=""
+                    readonly="False"
+                    needupdate="False"
+                    visible="True"
+                    persistent="True"
+                    isparameter="False"/>
+          <property name="Customer"
+                    caption="Customer"
+                    control="text"
+                    default=""
+                    readonly="False"
+                    needupdate="False"
+                    visible="True"
+                    persistent="True"
+                    isparameter="False"/>
+          <property name="Analyst"
+                    caption="Analyst"
+                    control="text"
+                    default=""
+                    readonly="False"
+                    needupdate="False"
+                    visible="True"
+                    persistent="True"
+                    isparameter="False"/>
+          <property name="ProjectStatus"
+                    caption="Status"
+                    control="select"
+                    default="Active"
+                    readonly="False"
+                    needupdate="False"
+                    visible="True"
+                    persistent="True"
+                    isparameter="False">
+            <attributes options="Active,In Review,Complete,On Hold,Archived"/>
+          </property>
+          <property name="Revision"
+                    caption="Revision"
+                    control="text"
+                    default="Rev 0"
+                    readonly="False"
+                    needupdate="False"
+                    visible="True"
+                    persistent="True"
+                    isparameter="False"/>
+        </propertygroup>
+
+        <propertygroup name="RepositoryStats" caption="Repository Summary">
+          <property name="TotalFiles"
+                    caption="Total Files"
+                    control="text"
+                    default="0"
+                    readonly="True"
+                    visible="True"
+                    persistent="True"
+                    isparameter="False"/>
+          <property name="MissingFiles"
+                    caption="Missing Files"
+                    control="text"
+                    default="0"
+                    readonly="True"
+                    visible="True"
+                    persistent="True"
+                    isparameter="False"/>
+          <property name="LastRefresh"
+                    caption="Last Refreshed"
+                    control="text"
+                    default="Never"
+                    readonly="True"
+                    visible="True"
+                    persistent="True"
+                    isparameter="False"/>
+        </propertygroup>
+
+      </task>
+    </tasks>
+
+    <!-- ================================================================
+         TASK GROUP  (the system header/container shown in the schematic)
+         ================================================================ -->
+    <taskgroups>
+      <taskgroup name="AnalysisHubGroup"
+                 caption="Analysis Hub"
+                 icon="hub_system"
+                 category="Analysis Management"
+                 abbreviation="AH"
+                 version="1"
+                 isparametricgroup="False">
+        <includetask name="RepositoryTask"/>
+      </taskgroup>
+    </taskgroups>
+
+  </workflow>
+
+</extension>

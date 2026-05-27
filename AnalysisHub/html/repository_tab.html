@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Analysis Repository</title>
+  <style>
+    :root {
+      --ansys-blue: #0078d4;
+      --green:      #107c10;
+      --red:        #d13438;
+      --bg:         #f3f3f3;
+      --surface:    #ffffff;
+      --border:     #e0e0e0;
+      --text:       #212529;
+      --subtext:    #6c757d;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Segoe UI', Tahoma, sans-serif;
+      font-size: 13px;
+      color: var(--text);
+      background: var(--bg);
+    }
+
+    /* ── Toolbar ── */
+    .toolbar {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 12px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      box-shadow: 0 2px 4px rgba(0,0,0,.08);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    button {
+      padding: 5px 12px;
+      border: 1px solid #ccc;
+      border-radius: 3px;
+      background: var(--surface);
+      color: var(--text);
+      cursor: pointer;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    button:hover  { background: #f0f0f0; }
+    button:active { background: #e0e0e0; }
+    .btn-primary  { background: var(--ansys-blue); color: #fff; border-color: var(--ansys-blue); }
+    .btn-primary:hover { background: #006abe; }
+    .toolbar-spacer { flex: 1; }
+
+    /* ── Tabs ── */
+    .tab-bar {
+      display: flex;
+      background: var(--surface);
+      border-bottom: 2px solid var(--ansys-blue);
+      padding: 0 12px;
+    }
+    .tab-btn {
+      padding: 8px 18px;
+      border: none;
+      background: transparent;
+      cursor: pointer;
+      font-size: 13px;
+      color: var(--subtext);
+      border-bottom: 3px solid transparent;
+      margin-bottom: -2px;
+    }
+    .tab-btn.active {
+      color: var(--ansys-blue);
+      border-bottom-color: var(--ansys-blue);
+      font-weight: 600;
+    }
+    .tab-btn:hover { color: var(--ansys-blue); }
+
+    /* ── Table ── */
+    .section { display: none; padding: 12px; }
+    .section.active { display: block; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--surface);
+      box-shadow: 0 1px 4px rgba(0,0,0,.08);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    thead th {
+      background: #f8f9fa;
+      font-weight: 600;
+      padding: 10px 12px;
+      text-align: left;
+      border-bottom: 2px solid var(--border);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+      color: var(--subtext);
+    }
+    tbody tr:nth-child(even) { background: #f9fbff; }
+    tbody tr:hover { background: #e8f0fe; }
+    td { padding: 9px 12px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 10px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .badge-ok      { background: #d4edda; color: var(--green); }
+    .badge-missing { background: #f8d7da; color: var(--red); }
+
+    .actions button { padding: 3px 8px; font-size: 11px; margin-right: 3px; }
+
+    .empty-row td {
+      text-align: center;
+      padding: 40px;
+      color: var(--subtext);
+      font-style: italic;
+    }
+
+    /* ── Status bar ── */
+    .status-bar {
+      position: fixed;
+      bottom: 0; left: 0; right: 0;
+      background: #f8f9fa;
+      border-top: 1px solid var(--border);
+      padding: 5px 14px;
+      font-size: 12px;
+      color: var(--subtext);
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Toolbar -->
+  <div class="toolbar">
+    <button class="btn-primary" onclick="ext('RefreshData')">&#x21BA; Refresh</button>
+    <button onclick="ext('AddFile')">&#x2795; Add File&#x2026;</button>
+    <button onclick="ext('OpenSelected')">&#x25B6; Open</button>
+    <button onclick="ext('RemoveSelected')">&#x2716; Remove</button>
+    <button onclick="ext('EditNotes')">&#x270E; Notes</button>
+    <button onclick="ext('HealthCheck')">&#x2764; Health Check</button>
+    <span class="toolbar-spacer"></span>
+    <span id="statusText" style="color:var(--subtext);font-size:12px;">Ready</span>
+  </div>
+
+  <!-- Section tabs -->
+  <div class="tab-bar">
+    <button class="tab-btn active" onclick="showSection('main',this)">
+      Main WB Database <span id="badge_main"></span>
+    </button>
+    <button class="tab-btn" onclick="showSection('supp',this)">
+      Supplemental WB Database <span id="badge_supp"></span>
+    </button>
+    <button class="tab-btn" onclick="showSection('cust',this)">
+      Customer Provided Data <span id="badge_cust"></span>
+    </button>
+  </div>
+
+  <!-- Sections -->
+  <div id="sec_main" class="section active">
+    <table><thead><tr>
+      <th style="width:30%">File Name</th>
+      <th style="width:8%">Status</th>
+      <th style="width:7%">Size (MB)</th>
+      <th style="width:13%">Modified</th>
+      <th style="width:13%">Date Added</th>
+      <th style="width:15%">Notes</th>
+      <th style="width:14%">Actions</th>
+    </tr></thead>
+    <tbody id="body_main"></tbody></table>
+  </div>
+
+  <div id="sec_supp" class="section">
+    <table><thead><tr>
+      <th style="width:30%">File Name</th>
+      <th style="width:8%">Status</th>
+      <th style="width:7%">Size (MB)</th>
+      <th style="width:13%">Modified</th>
+      <th style="width:13%">Date Added</th>
+      <th style="width:15%">Notes</th>
+      <th style="width:14%">Actions</th>
+    </tr></thead>
+    <tbody id="body_supp"></tbody></table>
+  </div>
+
+  <div id="sec_cust" class="section">
+    <table><thead><tr>
+      <th style="width:30%">File Name</th>
+      <th style="width:8%">Status</th>
+      <th style="width:7%">Size (MB)</th>
+      <th style="width:13%">Modified</th>
+      <th style="width:13%">Date Added</th>
+      <th style="width:15%">Notes</th>
+      <th style="width:14%">Actions</th>
+    </tr></thead>
+    <tbody id="body_cust"></tbody></table>
+  </div>
+
+  <div class="status-bar" id="statusBar">Analysis Repository — Loading&#x2026;</div>
+
+  <script>
+    var _currentSection = 'main';
+    var _sectionMap = { main: 'main_wb_database', supp: 'supplemental_wb_database', cust: 'customer_provided_data' };
+
+    function ext(cmd, arg) {
+      try {
+        if (arg !== undefined) window.external[cmd](arg);
+        else window.external[cmd]();
+      } catch(e) { console.warn('ext call failed:', cmd, e); }
+    }
+
+    function showSection(key, btn) {
+      _currentSection = key;
+      document.querySelectorAll('.section').forEach(function(el){ el.classList.remove('active'); });
+      document.getElementById('sec_' + key).classList.add('active');
+      document.querySelectorAll('.tab-btn').forEach(function(b){ b.classList.remove('active'); });
+      btn.classList.add('active');
+      ext('SectionChanged', _sectionMap[key]);
+    }
+
+    function updateSection(key, jsonData) {
+      var data = JSON.parse(jsonData);
+      var tbody = document.getElementById('body_' + key);
+      tbody.innerHTML = '';
+
+      if (data.length === 0) {
+        var tr = document.createElement('tr');
+        tr.className = 'empty-row';
+        tr.innerHTML = '<td colspan="7">No files yet. Use &#x2795; Add File to get started.</td>';
+        tbody.appendChild(tr);
+      } else {
+        data.forEach(function(f, i) {
+          var statusCls = f.status === 'MISSING' ? 'badge-missing' : 'badge-ok';
+          var tr = document.createElement('tr');
+          tr.innerHTML =
+            '<td><strong>' + esc(f.label) + '</strong></td>' +
+            '<td><span class="badge ' + statusCls + '">' + esc(f.status) + '</span></td>' +
+            '<td>' + esc(f.size_mb || '—') + '</td>' +
+            '<td>' + esc(f.modified || '—') + '</td>' +
+            '<td>' + esc(f.date_added || '') + '</td>' +
+            '<td style="color:#555;font-style:italic">' + esc(f.notes || '') + '</td>' +
+            '<td class="actions">' +
+              '<button onclick="ext(\'OpenFile\',' + i + ')">Open</button>' +
+              '<button onclick="ext(\'RemoveFile\',' + i + ')">Remove</button>' +
+            '</td>';
+          tbody.appendChild(tr);
+        });
+      }
+
+      // Update badge
+      var missing = data.filter(function(f){ return f.status === 'MISSING'; }).length;
+      var badge = document.getElementById('badge_' + key);
+      if (badge) badge.textContent = data.length > 0 ? '[' + data.length + (missing > 0 ? ' ✗'+missing : '') + ']' : '';
+    }
+
+    function setStatus(text) {
+      document.getElementById('statusText').textContent = text;
+      document.getElementById('statusBar').textContent = 'Analysis Repository — ' + text;
+    }
+
+    function esc(s) {
+      return String(s)
+        .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+        .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+
+    window.onload = function() { ext('RefreshData'); };
+  </script>
+</body>
+</html>
