@@ -332,6 +332,34 @@ def update_file_notes(section, index, notes):
         return True
     return False
 
+def relink_file_record(section, index, new_path):
+    """
+    Update the stored file path for a record — used when a file has
+    moved and the user browses to its new location via the Relink dialog.
+    Also resets the label to the new filename if the label previously
+    matched the old filename (i.e. was never manually renamed).
+    """
+    data = load_manifest()
+    records = data["sections"].get(section, [])
+    if 0 <= index < len(records):
+        old_path  = records[index].get("source_path", "")
+        old_label = records[index].get("label", "")
+        old_name  = os.path.basename(old_path)
+        new_name  = os.path.basename(new_path)
+
+        records[index]["source_path"] = new_path
+
+        # Auto-update the label only if it still matches the old filename
+        # (meaning the user never gave it a custom name)
+        if old_label == old_name:
+            records[index]["label"] = new_name
+
+        save_manifest(data)
+        _safe_log("Relinked [{0}] index {1}: {2} -> {3}".format(
+            section, index, old_path, new_path))
+        return True
+    _safe_log("Relink failed: index {0} out of range".format(index))
+    return False
 
 def rename_file_record(section, index, new_label):
     """Rename the label of a specific record."""

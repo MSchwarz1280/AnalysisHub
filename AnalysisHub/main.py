@@ -14,6 +14,16 @@ Key design rules
 * Backend logic lives exclusively in repository_helpers.py.
 * Every public function is try/except-wrapped and writes to the debug log.
 * IronPython 2.7 syntax: no f-strings, no Python-3-only builtins.
+
+Changes in this version
+-----------------------
+* Column header sort — click any column header to sort ascending/descending.
+  Each tab maintains its own independent sort state.
+* Right-click context menu on file rows — Open, Notes, Relink, Remove.
+* Relink missing files — browse for the new location of a missing file and
+  update the manifest path in place.
+* Column header custom drawing — grey background, bold text, separator line.
+* Active tab drawing — blue background / white bold text on selected tab.
 """
 
 import os
@@ -32,13 +42,12 @@ import System.Windows.Forms as WinForms
 import System.Drawing        as Drawing
 
 # ── Local backend ──────────────────────────────────────────────────────────
-# Use the extension install directory so imports work regardless of CWD.
 try:
     _EXT_DIR = os.path.join(ExtAPI.Extension.InstallDir, "AnalysisHub")
     if _EXT_DIR not in sys.path:
         sys.path.insert(0, _EXT_DIR)
 except Exception:
-    pass  # ExtAPI not ready yet — will be fine by the time callbacks fire
+    pass
 
 import repository_helpers as repo
 
@@ -48,8 +57,6 @@ import repository_helpers as repo
 
 LOG_PATH = r"C:\Temp\AnalysisHub_debug.log"
 
-# ── Clear/initialise the log at MODULE LOAD TIME so that every
-#    "Reload Extension" in Workbench starts with a fresh log file.
 try:
     with open(LOG_PATH, "w") as _fh:
         _fh.write("=" * 80 + "\n")
@@ -72,42 +79,23 @@ def _log(msg):
 
 
 # ────────────────────────────────────────────────────────────────────────────
-#  Project-directory resolution  (called once per launch)
+#  Project-directory resolution
 # ────────────────────────────────────────────────────────────────────────────
 
 def _resolve_project_dir(task=None):
-    """
-    Resolve the Workbench project's user_files directory using the
-    officially documented approach (ANSYS solution: GetUserFiles.pdf):
-
-        Project.GetProjectFile()  →  full path to the .wbpj file
-        Derive:  <wbpj_dir>\\<project_name>_files\\user_files
-
-    Falls back through several approaches in order of reliability.
-    Returns the user_files path string, or None if no project is saved.
-    """
-
-    # ── Approach 1: Project.GetProjectFile() — the correct documented API ──
-    # This works in both toolbar-button context and task-callback context.
     try:
         wbpj_path = Project.GetProjectFile()
         if wbpj_path and wbpj_path.strip():
             wbpj_path = wbpj_path.strip()
-            # Directory containing the .wbpj
             proj_dir  = wbpj_path[:wbpj_path.rfind("\\")]
-            # Project name without extension  (e.g. "demo" from "demo.wbpj")
             proj_name = wbpj_path[wbpj_path.rfind("\\") + 1:-5]
             user_files = proj_dir + "\\" + proj_name + "_files\\user_files"
             _log("Resolved user_files via Project.GetProjectFile(): " + user_files)
-            # user_files may not exist yet on a freshly saved project — that's OK,
-            # repository_helpers will create it.  Just verify the parent _files dir
-            # exists or the .wbpj itself is real.
             if os.path.exists(proj_dir):
                 return user_files
     except Exception as exc:
         _log("Project.GetProjectFile() failed: " + str(exc))
 
-    # ── Approach 2: task.ActiveDirectory (task-callback context only) ──
     if task is not None:
         try:
             ad = task.ActiveDirectory
@@ -117,7 +105,6 @@ def _resolve_project_dir(task=None):
         except Exception as exc:
             _log("task.ActiveDirectory failed: " + str(exc))
 
-    # ── Approach 3: ExtAPI.DataModel task scan ──
     try:
         for tg in ExtAPI.DataModel.TaskGroups:
             if tg.Name == "AnalysisHubGroup":
@@ -138,7 +125,6 @@ def _resolve_project_dir(task=None):
 # ────────────────────────────────────────────────────────────────────────────
 
 def _smart_open_file(path):
-    """Open a file with the best available application."""
     if not path or not os.path.exists(path):
         _log("Open failed — file does not exist: " + str(path))
         return False
@@ -147,7 +133,6 @@ def _smart_open_file(path):
     _log("Opening: {0}  (ext={1})".format(path, ext))
 
     try:
-        # --- Workbench project files: use the CURRENT runwb2.exe ---
         if ext in (".wbpj", ".wbpz"):
             try:
                 install_root = Ansys.Utilities.ApplicationConfiguration.DefaultConfiguration.AwpRootEnvironmentVariableValue
@@ -161,12 +146,9 @@ def _smart_open_file(path):
                     System.Diagnostics.Process.Start(info)
                     _log("Opened .wbpj with runwb2: " + runwb2)
                     return True
-                else:
-                    _log("runwb2 not found, falling through to ShellExecute")
             except Exception as exc:
                 _log("runwb2 launch error: " + str(exc))
 
-        # --- Text/code files: prefer Notepad++ if installed ---
         if ext in (".txt", ".py", ".log", ".csv", ".md", ".xml", ".json", ".ini", ".bat"):
             notepadpp = r"C:\Program Files\Notepad++\notepad++.exe"
             if os.path.exists(notepadpp):
@@ -174,7 +156,6 @@ def _smart_open_file(path):
                 _log("Opened with Notepad++")
                 return True
 
-        # --- Default: Windows shell open (respects file associations) ---
         os.startfile(path)
         _log("Opened with default Windows application")
         return True
@@ -182,7 +163,7 @@ def _smart_open_file(path):
     except Exception as exc:
         _log("_smart_open_file error: " + str(exc))
         try:
-            os.startfile(path)   # absolute last resort
+            os.startfile(path)
             return True
         except Exception:
             pass
@@ -190,34 +171,43 @@ def _smart_open_file(path):
 
 
 # ────────────────────────────────────────────────────────────────────────────
-#  UI Colours / constants (ANSYS-style palette)
+#  UI Colors / constants
 # ────────────────────────────────────────────────────────────────────────────
 
-_CLR_ANSYS_BLUE  = Drawing.Color.FromArgb(0,  120, 212)   # #0078D4
-_CLR_HEADER_BG   = Drawing.Color.FromArgb(33,  37,  41)   # dark toolbar
+_CLR_ANSYS_BLUE  = Drawing.Color.FromArgb(0,  120, 212)
+_CLR_HEADER_BG   = Drawing.Color.FromArgb(33,  37,  41)
 _CLR_HEADER_FG   = Drawing.Color.White
-_CLR_READY       = Drawing.Color.FromArgb(16, 124,  16)   # green
-_CLR_MISSING     = Drawing.Color.FromArgb(209,  52,  56)  # red
-_CLR_ROW_ALT     = Drawing.Color.FromArgb(245, 247, 250)  # very light blue-grey
-_CLR_SECTION_HDR = Drawing.Color.FromArgb(220, 230, 245)  # section separator
-_CLR_COL_HEADER  = Drawing.Color.FromArgb(240, 242, 245)  # column header background
+_CLR_READY       = Drawing.Color.FromArgb(16, 124,  16)
+_CLR_MISSING     = Drawing.Color.FromArgb(209,  52,  56)
+_CLR_ROW_ALT     = Drawing.Color.FromArgb(245, 247, 250)
+_CLR_SECTION_HDR = Drawing.Color.FromArgb(220, 230, 245)
+_CLR_COL_HEADER  = Drawing.Color.FromArgb(240, 242, 245)   # column header background
 
 _FONT_NORMAL = Drawing.Font("Segoe UI",  9.5)
 _FONT_BOLD   = Drawing.Font("Segoe UI",  9.5, Drawing.FontStyle.Bold)
 _FONT_TITLE  = Drawing.Font("Segoe UI", 13,   Drawing.FontStyle.Bold)
 _FONT_SMALL  = Drawing.Font("Segoe UI",  8.5)
 
+# Column index constants — update here if column order ever changes
+COL_FILENAME   = 0
+COL_STATUS     = 1
+COL_SIZE       = 2
+COL_MODIFIED   = 3
+COL_DATEADDED  = 4
+COL_NOTES      = 5
+COL_FULLPATH   = 6
+
 
 # ────────────────────────────────────────────────────────────────────────────
-#  Helper — build a styled toolbar Button
+#  Button factory
 # ────────────────────────────────────────────────────────────────────────────
 
 def _make_btn(text, x, y, w=160, h=36, primary=False, handler=None):
     btn = WinForms.Button()
-    btn.Text     = text
-    btn.Location = Drawing.Point(x, y)
-    btn.Size     = Drawing.Size(w, h)
-    btn.Font     = _FONT_NORMAL
+    btn.Text      = text
+    btn.Location  = Drawing.Point(x, y)
+    btn.Size      = Drawing.Size(w, h)
+    btn.Font      = _FONT_NORMAL
     btn.FlatStyle = WinForms.FlatStyle.Flat
     if primary:
         btn.BackColor = _CLR_ANSYS_BLUE
@@ -237,10 +227,8 @@ def _make_btn(text, x, y, w=160, h=36, primary=False, handler=None):
 # ────────────────────────────────────────────────────────────────────────────
 
 class NotesDialog(WinForms.Form):
-    """Small dialog for viewing/editing a file record's notes field."""
-
     def __init__(self, current_notes=""):
-        self.result_notes = current_notes
+        self.result_notes  = current_notes
         self.Text          = "File Notes"
         self.Width         = 480
         self.Height        = 260
@@ -264,10 +252,8 @@ class NotesDialog(WinForms.Form):
         self._tb.Text       = current_notes
         self.Controls.Add(self._tb)
 
-        btn_ok = _make_btn("OK", 260, 185, 90, 32, primary=True, handler=self._ok)
-        btn_cn = _make_btn("Cancel", 360, 185, 90, 32, handler=self._cancel)
-        self.Controls.Add(btn_ok)
-        self.Controls.Add(btn_cn)
+        self.Controls.Add(_make_btn("OK",     260, 185, 90, 32, primary=True, handler=self._ok))
+        self.Controls.Add(_make_btn("Cancel", 360, 185, 90, 32, handler=self._cancel))
 
     def _ok(self, s, e):
         self.result_notes = self._tb.Text
@@ -284,11 +270,9 @@ class NotesDialog(WinForms.Form):
 # ────────────────────────────────────────────────────────────────────────────
 
 class RevisionDialog(WinForms.Form):
-    """Dialog to record a new revision entry."""
-
     def __init__(self, current_rev=""):
-        self.result_rev  = ""
-        self.result_note = ""
+        self.result_rev    = ""
+        self.result_note   = ""
         self.Text          = "Add Revision Entry"
         self.Width         = 460
         self.Height        = 240
@@ -298,7 +282,6 @@ class RevisionDialog(WinForms.Form):
         self.BackColor     = Drawing.Color.White
         self.Font          = _FONT_NORMAL
 
-        WinForms.Label()
         lbl_rev = WinForms.Label()
         lbl_rev.Text     = "Revision label (e.g. Rev A, v1.2):"
         lbl_rev.Location = Drawing.Point(12, 14)
@@ -323,10 +306,8 @@ class RevisionDialog(WinForms.Form):
         self._tb_note.Size      = Drawing.Size(420, 68)
         self.Controls.Add(self._tb_note)
 
-        btn_ok = _make_btn("Save", 240, 172, 90, 32, primary=True, handler=self._ok)
-        btn_cn = _make_btn("Cancel", 340, 172, 90, 32, handler=self._cancel)
-        self.Controls.Add(btn_ok)
-        self.Controls.Add(btn_cn)
+        self.Controls.Add(_make_btn("Save",   240, 172, 90, 32, primary=True, handler=self._ok))
+        self.Controls.Add(_make_btn("Cancel", 340, 172, 90, 32, handler=self._cancel))
 
     def _ok(self, s, e):
         self.result_rev  = self._tb_rev.Text.strip()
@@ -343,12 +324,10 @@ class RevisionDialog(WinForms.Form):
 
 
 # ────────────────────────────────────────────────────────────────────────────
-#  Health-check report dialog
+#  Health-check dialog
 # ────────────────────────────────────────────────────────────────────────────
 
 class HealthCheckDialog(WinForms.Form):
-    """Read-only report dialog showing repository health status."""
-
     def __init__(self, health):
         self.Text          = "Repository Health Check"
         self.Width         = 700
@@ -359,7 +338,6 @@ class HealthCheckDialog(WinForms.Form):
         self.BackColor     = Drawing.Color.White
         self.Font          = _FONT_NORMAL
 
-        # Summary header
         total   = health["total"]
         missing = health["missing"]
         ready   = health["ready"]
@@ -380,20 +358,19 @@ class HealthCheckDialog(WinForms.Form):
         lbl_sum.AutoSize = True
         self.Controls.Add(lbl_sum)
 
-        # ListView of issues
         lv = WinForms.ListView()
-        lv.View          = WinForms.View.Details
-        lv.FullRowSelect  = True
-        lv.GridLines      = True
-        lv.Location       = Drawing.Point(16, 76)
-        lv.Size           = Drawing.Size(650, 330)
-        lv.Font           = _FONT_NORMAL
+        lv.View         = WinForms.View.Details
+        lv.FullRowSelect = True
+        lv.GridLines     = True
+        lv.Location      = Drawing.Point(16, 76)
+        lv.Size          = Drawing.Size(650, 330)
+        lv.Font          = _FONT_NORMAL
         lv.Columns.Add("Section",   160)
         lv.Columns.Add("File Name", 200)
         lv.Columns.Add("Path",      270)
 
         if missing == 0:
-            item = lv.Items.Add("—")
+            item = lv.Items.Add(u"\u2014")
             item.SubItems.Add("No missing files detected.")
             item.SubItems.Add("")
         else:
@@ -404,37 +381,29 @@ class HealthCheckDialog(WinForms.Form):
                 item.ForeColor = _CLR_MISSING
 
         self.Controls.Add(lv)
-
-        btn_close = _make_btn("Close", 560, 415, 100, 32, primary=True,
-                              handler=lambda s, e: self.Close())
-        self.Controls.Add(btn_close)
+        self.Controls.Add(_make_btn("Close", 560, 415, 100, 32, primary=True,
+                                    handler=lambda s, e: self.Close()))
 
 
 # ────────────────────────────────────────────────────────────────────────────
-#  Project-info panel (embedded in the main form)
+#  Project-info panel
 # ────────────────────────────────────────────────────────────────────────────
 
 class ProjectInfoPanel(WinForms.Panel):
-    """
-    Collapsible panel showing editable project metadata at the top of the form.
-    """
-
     def __init__(self, form_ref):
-        self._form = form_ref
+        self._form     = form_ref
         self._expanded = True
-        self.BackColor  = Drawing.Color.FromArgb(245, 248, 252)
+        self.BackColor   = Drawing.Color.FromArgb(245, 248, 252)
         self.BorderStyle = WinForms.BorderStyle.FixedSingle
-
         self._build_ui()
         self._load_values()
 
     def _build_ui(self):
-        # Header row
         lbl = WinForms.Label()
-        lbl.Text      = "Project Information"
-        lbl.Font      = _FONT_BOLD
-        lbl.Location  = Drawing.Point(8, 7)
-        lbl.AutoSize  = True
+        lbl.Text     = "Project Information"
+        lbl.Font     = _FONT_BOLD
+        lbl.Location = Drawing.Point(8, 7)
+        lbl.AutoSize = True
         self.Controls.Add(lbl)
 
         btn_toggle = WinForms.Button()
@@ -448,21 +417,16 @@ class ProjectInfoPanel(WinForms.Panel):
         self._btn_toggle     = btn_toggle
         self.Controls.Add(btn_toggle)
 
-        btn_save = _make_btn("Save Info", 300, 4, 90, 22, primary=True,
-                             handler=self._save)
-        self.Controls.Add(btn_save)
+        self.Controls.Add(_make_btn("Save Info", 300, 4, 90, 22, primary=True,
+                                    handler=self._save))
 
-        # Fields
-        fields = [
-            ("Title",     "_tb_title",    0),
-            ("Customer",  "_tb_customer", 1),
-            ("Analyst",   "_tb_analyst",  2),
-        ]
         self._fields_panel = WinForms.Panel()
         self._fields_panel.Location = Drawing.Point(0, 32)
 
         x0 = 8
-        for caption, attr, col in fields:
+        for caption, attr, col in [("Title", "_tb_title", 0),
+                                    ("Customer", "_tb_customer", 1),
+                                    ("Analyst", "_tb_analyst", 2)]:
             lbl2 = WinForms.Label()
             lbl2.Text     = caption + ":"
             lbl2.Location = Drawing.Point(x0 + col * 200, 6)
@@ -476,7 +440,6 @@ class ProjectInfoPanel(WinForms.Panel):
             setattr(self, attr, tb)
             self._fields_panel.Controls.Add(tb)
 
-        # Status combo
         lbl_s = WinForms.Label()
         lbl_s.Text     = "Status:"
         lbl_s.Location = Drawing.Point(x0 + 3 * 200, 6)
@@ -491,7 +454,6 @@ class ProjectInfoPanel(WinForms.Panel):
             self._cb_status.Items.Add(s)
         self._fields_panel.Controls.Add(self._cb_status)
 
-        # Revision row
         lbl_r = WinForms.Label()
         lbl_r.Text     = "Revision:"
         lbl_r.Location = Drawing.Point(x0, 36)
@@ -503,9 +465,9 @@ class ProjectInfoPanel(WinForms.Panel):
         self._tb_rev.Size     = Drawing.Size(118, 24)
         self._fields_panel.Controls.Add(self._tb_rev)
 
-        btn_rev = _make_btn(u"\u2795 Log Revision", x0 + 200, 32, 140, 26,
-                            primary=False, handler=self._log_revision)
-        self._fields_panel.Controls.Add(btn_rev)
+        self._fields_panel.Controls.Add(
+            _make_btn(u"\u2795 Log Revision", x0 + 200, 32, 140, 26,
+                      handler=self._log_revision))
 
         self._fields_panel.Size = Drawing.Size(900, 66)
         self.Controls.Add(self._fields_panel)
@@ -519,7 +481,9 @@ class ProjectInfoPanel(WinForms.Panel):
             self._tb_analyst.Text  = info.get("analyst",  "")
             self._tb_rev.Text      = info.get("revision", "Rev 0")
             status = info.get("status", "Active")
-            if status in [self._cb_status.Items[i] for i in range(self._cb_status.Items.Count)]:
+            items  = [self._cb_status.Items[i]
+                      for i in range(self._cb_status.Items.Count)]
+            if status in items:
                 self._cb_status.SelectedItem = status
             else:
                 self._cb_status.SelectedIndex = 0
@@ -528,14 +492,13 @@ class ProjectInfoPanel(WinForms.Panel):
 
     def _save(self, s, e):
         try:
-            info = {
+            repo.save_project_info({
                 "title":    self._tb_title.Text,
                 "customer": self._tb_customer.Text,
                 "analyst":  self._tb_analyst.Text,
                 "status":   str(self._cb_status.SelectedItem or "Active"),
                 "revision": self._tb_rev.Text,
-            }
-            repo.save_project_info(info)
+            })
             _log("Project info saved")
         except Exception as exc:
             _log("ProjectInfoPanel save error: " + str(exc))
@@ -549,7 +512,8 @@ class ProjectInfoPanel(WinForms.Panel):
                 self._tb_rev.Text = dlg.result_rev
                 self._save(None, None)
                 WinForms.MessageBox.Show(
-                    "Revision '{0}' logged.".format(dlg.result_rev), "Revision Added")
+                    "Revision '{0}' logged.".format(dlg.result_rev),
+                    "Revision Added")
         except Exception as exc:
             _log("Log revision error: " + str(exc))
 
@@ -571,21 +535,18 @@ class ProjectInfoPanel(WinForms.Panel):
 
 class RepositoryForm(WinForms.Form):
     """
-    Primary Analysis Repository Manager window.
-
-    Layout
-    ------
-    [Header]
-    [Toolbar buttons]
-    [ProjectInfoPanel]  (collapsible)
-    [Tab control — one tab per section]
-      [ListView per section]
-    [Status bar]
+    Layout: Header → Toolbar → ProjectInfoPanel → TabControl (one tab per
+    section, each containing a styled ListView) → StatusBar.
     """
 
     def __init__(self, task=None):
         self._task         = task
-        self._section_data = {}   # section_id -> list of enriched records
+        self._section_data = {}          # section_id -> list of enriched records
+
+        # Per-tab sort state: section_id -> {"col": int, "asc": bool}
+        self._sort_state   = {sec: {"col": COL_FILENAME, "asc": True}
+                              for sec in repo.ALL_SECTIONS}
+
         self._cur_section  = repo.ALL_SECTIONS[0]
 
         self.Text          = "Analysis Repository Manager"
@@ -603,12 +564,10 @@ class RepositoryForm(WinForms.Form):
         self._refresh_all(None, None)
         _log("RepositoryForm init complete")
 
-    # ── UI construction ────────────────────────────────────────────────────
+    # ── UI construction ───────────────────────────────────────────────────
 
     def _build_ui(self):
-        """Construct all controls."""
-
-        # ── Header label ──
+        # Header
         lbl_h = WinForms.Label()
         lbl_h.Text      = "Analysis Repository"
         lbl_h.Font      = _FONT_TITLE
@@ -618,80 +577,76 @@ class RepositoryForm(WinForms.Form):
         self.Controls.Add(lbl_h)
 
         lbl_sub = WinForms.Label()
-        lbl_sub.Text     = "Centralized file management for your ANSYS project"
-        lbl_sub.Font     = _FONT_SMALL
+        lbl_sub.Text      = "Centralized file management for your ANSYS project"
+        lbl_sub.Font      = _FONT_SMALL
         lbl_sub.ForeColor = Drawing.Color.Gray
-        lbl_sub.Location = Drawing.Point(18, 38)
-        lbl_sub.AutoSize = True
+        lbl_sub.Location  = Drawing.Point(18, 38)
+        lbl_sub.AutoSize  = True
         self.Controls.Add(lbl_sub)
 
-        # ── Toolbar ──
+        # Toolbar
         toolbar_y = 62
         toolbar_h = 42
 
-        self._btn_add = _make_btn(u"\u2795  Add File(s)...", 16, toolbar_y, 160, toolbar_h,
-                                   primary=True, handler=self._on_add)
+        self._btn_add = _make_btn(u"\u2795  Add File(s)...", 16, toolbar_y, 160,
+                                   toolbar_h, primary=True, handler=self._on_add)
         self.Controls.Add(self._btn_add)
-
-        self._btn_refresh = _make_btn(u"\u21BA  Refresh", 186, toolbar_y, 110, toolbar_h,
-                                       handler=self._refresh_all)
+        self._btn_refresh = _make_btn(u"\u21BA  Refresh", 186, toolbar_y, 110,
+                                       toolbar_h, handler=self._refresh_all)
         self.Controls.Add(self._btn_refresh)
-
-        self._btn_open = _make_btn(u"\u25B6  Open", 306, toolbar_y, 100, toolbar_h,
-                                    handler=self._on_open)
+        self._btn_open = _make_btn(u"\u25B6  Open", 306, toolbar_y, 100,
+                                    toolbar_h, handler=self._on_open)
         self.Controls.Add(self._btn_open)
-
-        self._btn_remove = _make_btn(u"\u2716  Remove", 416, toolbar_y, 110, toolbar_h,
-                                      handler=self._on_remove)
+        self._btn_remove = _make_btn(u"\u2716  Remove", 416, toolbar_y, 110,
+                                      toolbar_h, handler=self._on_remove)
         self.Controls.Add(self._btn_remove)
-
-        self._btn_notes = _make_btn(u"\u270E  Notes", 536, toolbar_y, 100, toolbar_h,
-                                     handler=self._on_notes)
+        self._btn_notes = _make_btn(u"\u270E  Notes", 536, toolbar_y, 100,
+                                     toolbar_h, handler=self._on_notes)
         self.Controls.Add(self._btn_notes)
-
-        self._btn_health = _make_btn(u"\u2764  Health Check", 646, toolbar_y, 140, toolbar_h,
-                                      handler=self._on_health_check)
+        self._btn_health = _make_btn(u"\u2764  Health Check", 646, toolbar_y,
+                                      140, toolbar_h, handler=self._on_health_check)
         self.Controls.Add(self._btn_health)
 
-        # separator label (spacer visual)
         sep = WinForms.Label()
         sep.BorderStyle = WinForms.BorderStyle.Fixed3D
         sep.Location    = Drawing.Point(16, toolbar_y + toolbar_h + 4)
         sep.Size        = Drawing.Size(1310, 2)
         self.Controls.Add(sep)
 
-        # ── Project Info Panel ──
+        # Project info panel
         self._info_panel = ProjectInfoPanel(self)
         self._info_panel.Location = Drawing.Point(16, toolbar_y + toolbar_h + 10)
         self.Controls.Add(self._info_panel)
-        self._info_panel_bottom = toolbar_y + toolbar_h + 10 + self._info_panel.Height + 4
+        self._info_panel_bottom = (toolbar_y + toolbar_h + 10 +
+                                   self._info_panel.Height + 4)
 
-        # ── Tab control ──
+        # Tab control
         self._tabs = WinForms.TabControl()
         self._tabs.Location = Drawing.Point(16, self._info_panel_bottom)
         self._tabs.Anchor   = (WinForms.AnchorStyles.Top    |
                                WinForms.AnchorStyles.Bottom |
                                WinForms.AnchorStyles.Left   |
                                WinForms.AnchorStyles.Right)
-        self._tabs.Font     = _FONT_NORMAL
+        self._tabs.Font                  = _FONT_NORMAL
+        self._tabs.Padding = Drawing.Point(12, 4)
+        self._tabs.ItemSize = Drawing.Size(0, 28)
+        self._tabs.DrawMode              = WinForms.TabDrawMode.OwnerDrawFixed
+        self._tabs.DrawItem             += self._on_draw_tab
         self._tabs.SelectedIndexChanged += self._on_tab_changed
-        self._tabs.DrawMode = WinForms.TabDrawMode.OwnerDrawFixed
-        self._tabs.DrawItem += self._on_draw_tab
-        self._tabs.Font     = _FONT_NORMAL
 
         self._listviews = {}
 
         for sec in repo.ALL_SECTIONS:
             tab = WinForms.TabPage()
-            tab.Text    = repo.SECTION_LABELS[sec]
-            tab.Padding = WinForms.Padding(4)
+            tab.Text      = repo.SECTION_LABELS[sec]
+            tab.Padding   = WinForms.Padding(4)
             tab.BackColor = Drawing.Color.White
 
-            lv = self._make_listview()
-            lv.Anchor = (WinForms.AnchorStyles.Top    |
-                         WinForms.AnchorStyles.Bottom |
-                         WinForms.AnchorStyles.Left   |
-                         WinForms.AnchorStyles.Right)
+            lv = self._make_listview(sec)
+            lv.Anchor   = (WinForms.AnchorStyles.Top    |
+                           WinForms.AnchorStyles.Bottom |
+                           WinForms.AnchorStyles.Left   |
+                           WinForms.AnchorStyles.Right)
             lv.Location = Drawing.Point(0, 0)
             lv.Size     = Drawing.Size(tab.Width, tab.Height)
 
@@ -701,52 +656,115 @@ class RepositoryForm(WinForms.Form):
 
         self.Controls.Add(self._tabs)
 
-        # ── Status bar ──
+        # Status bar
         self._status_bar = WinForms.StatusStrip()
-        self._status_lbl  = WinForms.ToolStripStatusLabel()
+        self._status_lbl = WinForms.ToolStripStatusLabel()
         self._status_lbl.Text = "Ready"
         self._status_bar.Items.Add(self._status_lbl)
         self.Controls.Add(self._status_bar)
 
-        # Resize tab control to fill the form
         self.Resize += self._on_form_resize
         self._do_layout()
 
-    def _make_listview(self):
+    def _make_listview(self, section):
+        """Build a fully configured ListView for one section tab."""
         lv = WinForms.ListView()
-        lv.View         = WinForms.View.Details
-        lv.FullRowSelect = True
-        lv.GridLines     = True
-        lv.MultiSelect   = True
-        lv.Font          = _FONT_NORMAL
-        lv.BorderStyle   = WinForms.BorderStyle.FixedSingle
+        lv.View          = WinForms.View.Details
+        lv.FullRowSelect  = True
+        lv.GridLines      = True
+        lv.MultiSelect    = True
+        lv.Font           = _FONT_BOLD
+        lv.BorderStyle    = WinForms.BorderStyle.FixedSingle
 
-        # Owner-draw the column headers so we can set background
-        # color and draw the bottom separator line ourselves
-        lv.OwnerDraw          = True
-        lv.DrawColumnHeader  += self._on_draw_column_header
-        lv.DrawItem          += self._on_draw_item
-        lv.DrawSubItem       += self._on_draw_subitem
+        # Owner-draw headers for custom background + separator line
+        lv.HeaderStyle = WinForms.ColumnHeaderStyle.Clickable
 
-        cols = [
-            ("File Name",   380),
-            ("Status",       90),
-            ("Size (MB)",    90),
-            ("Modified",    150),
-            ("Date Added",  150),
-            ("Notes",       250),
-            ("Full Path",   400),
-        ]
-        for name, w in cols:
+        for name, w in [("File Name",  380), ("Status",    90),
+                         ("Size (MB)",  90), ("Modified", 150),
+                         ("Date Added",150), ("Notes",    250),
+                         ("Full Path", 400)]:
             lv.Columns.Add(name, w)
 
-        lv.DoubleClick += self._on_double_click
+        # Store which section this ListView belongs to so sort/menu handlers
+        # can identify it without searching self._listviews
+        lv.Tag = section
+
+        lv.ColumnClick  += self._on_column_click
+        lv.DoubleClick  += self._on_double_click
+        lv.MouseUp      += self._on_list_mouse_up   # right-click context menu
+
         return lv
+
+    # ── Custom drawing ────────────────────────────────────────────────────
+
+    def _on_draw_tab(self, s, e):
+        """Paint active tab blue/bold, inactive tabs grey."""
+        try:
+            is_active = (e.Index == self._tabs.SelectedIndex)
+            bg = _CLR_ANSYS_BLUE if is_active else Drawing.Color.FromArgb(240, 240, 240)
+            e.Graphics.FillRectangle(Drawing.SolidBrush(bg), e.Bounds)
+
+            fg   = Drawing.Color.White if is_active else Drawing.Color.FromArgb(100, 100, 100)
+            font = _FONT_BOLD if is_active else _FONT_NORMAL
+            text = self._tabs.TabPages[e.Index].Text
+
+            fmt = Drawing.StringFormat()
+            fmt.Alignment     = Drawing.StringAlignment.Center
+            fmt.LineAlignment = Drawing.StringAlignment.Center
+            e.Graphics.DrawString(
+                text, font, Drawing.SolidBrush(fg),
+                Drawing.RectangleF(e.Bounds.X, e.Bounds.Y,
+                                   e.Bounds.Width, e.Bounds.Height),
+                fmt)
+        except Exception as exc:
+            _log("Tab draw error: " + str(exc))
+
+    def _on_draw_column_header(self, s, e):
+        """Paint column headers: grey background, bold text, separator line."""
+        try:
+            e.Graphics.FillRectangle(Drawing.SolidBrush(_CLR_COL_HEADER), e.Bounds)
+
+            # Determine sort indicator for this column
+            lv  = s   # sender IS the ListView
+            sec = lv.Tag if lv.Tag else self._cur_section
+            st  = self._sort_state.get(sec, {"col": -1, "asc": True})
+            indicator = ""
+            if st["col"] == e.Index:
+                indicator = u"  \u25B2" if st["asc"] else u"  \u25BC"
+
+            text_rect = Drawing.RectangleF(
+                e.Bounds.X + 6, e.Bounds.Y,
+                e.Bounds.Width - 6, e.Bounds.Height)
+            fmt = Drawing.StringFormat()
+            fmt.LineAlignment = Drawing.StringAlignment.Center
+            e.Graphics.DrawString(
+                e.Header.Text + indicator, _FONT_BOLD,
+                Drawing.SolidBrush(Drawing.Color.FromArgb(33, 37, 41)),
+                text_rect, fmt)
+
+            # Column divider
+            e.Graphics.DrawLine(
+                Drawing.Pen(Drawing.Color.FromArgb(200, 200, 200), 1),
+                e.Bounds.Right - 1, e.Bounds.Top,
+                e.Bounds.Right - 1, e.Bounds.Bottom)
+
+            # Bottom separator
+            e.Graphics.DrawLine(
+                Drawing.Pen(Drawing.Color.FromArgb(160, 160, 165), 2),
+                e.Bounds.Left, e.Bounds.Bottom - 1,
+                e.Bounds.Right, e.Bounds.Bottom - 1)
+        except Exception as exc:
+            _log("Draw column header error: " + str(exc))
+
+    def _on_draw_item(self, s, e):
+        e.DrawDefault = True
+
+    def _on_draw_subitem(self, s, e):
+        e.DrawDefault = True
 
     # ── Layout helpers ────────────────────────────────────────────────────
 
     def on_panel_resize(self):
-        """Called by ProjectInfoPanel when it collapses/expands."""
         self._info_panel_bottom = (self._info_panel.Top +
                                    self._info_panel.Height + 4)
         self._do_layout()
@@ -755,7 +773,6 @@ class RepositoryForm(WinForms.Form):
         self._do_layout()
 
     def _do_layout(self):
-        """Recompute tab control size to fill available space."""
         sb_h  = self._status_bar.Height
         top   = self._info_panel_bottom
         avail = self.ClientSize.Height - top - sb_h - 4
@@ -763,96 +780,88 @@ class RepositoryForm(WinForms.Form):
             avail = 100
         self._tabs.Location = Drawing.Point(16, top)
         self._tabs.Size     = Drawing.Size(self.ClientSize.Width - 32, avail)
-        
-    def _on_draw_column_header(self, s, e):
-        """Paint column headers with a grey background and a bold bottom border line."""
-        try:
-            # Fill header background
-            e.Graphics.FillRectangle(
-                Drawing.SolidBrush(_CLR_COL_HEADER), e.Bounds)
 
-            # Draw the column header text, left-aligned with a small indent
-            text_rect = Drawing.RectangleF(
-                e.Bounds.X + 6, e.Bounds.Y,
-                e.Bounds.Width - 6, e.Bounds.Height)
-            fmt = Drawing.StringFormat()
-            fmt.LineAlignment = Drawing.StringAlignment.Center
-            e.Graphics.DrawString(
-                e.Header.Text, _FONT_BOLD,
-                Drawing.SolidBrush(Drawing.Color.FromArgb(33, 37, 41)),
-                text_rect, fmt)
-
-            # Draw right-side column divider (light grey)
-            pen_div = Drawing.Pen(Drawing.Color.FromArgb(200, 200, 200), 1)
-            e.Graphics.DrawLine(pen_div,
-                e.Bounds.Right - 1, e.Bounds.Top,
-                e.Bounds.Right - 1, e.Bounds.Bottom)
-
-            # Draw the bold bottom border line (the separator you want)
-            pen_sep = Drawing.Pen(Drawing.Color.FromArgb(160, 160, 165), 2)
-            e.Graphics.DrawLine(pen_sep,
-                e.Bounds.Left, e.Bounds.Bottom - 1,
-                e.Bounds.Right, e.Bounds.Bottom - 1)
-
-        except Exception as exc:
-            _log("Draw column header error: " + str(exc))
-
-    def _on_draw_item(self, s, e):
-        """Required by OwnerDraw — let the default drawing handle items."""
-        e.DrawDefault = True
-
-    def _on_draw_subitem(self, s, e):
-        """Required by OwnerDraw — let the default drawing handle subitems."""
-        e.DrawDefault = True
-        
     def _on_tab_changed(self, s, e):
         idx = self._tabs.SelectedIndex
         if 0 <= idx < len(repo.ALL_SECTIONS):
             self._cur_section = repo.ALL_SECTIONS[idx]
-            self._tabs.Invalidate()
+        self._tabs.Invalidate()
 
-    def _on_draw_tab(self, s, e):
-        """Custom tab painter — highlights the active tab in blue, greys out inactive."""
+    # ── Column sort ───────────────────────────────────────────────────────
+
+    def _on_column_click(self, s, e):
+        """
+        Sort the clicked column for the ListView that fired the event.
+        Each tab has its own independent sort state stored in self._sort_state.
+        Clicking the same column again reverses the sort direction.
+        Clicking a different column sorts ascending on that column.
+        """
         try:
-            is_active = (e.Index == self._tabs.SelectedIndex)
+            lv  = s
+            sec = lv.Tag if lv.Tag else self._cur_section
+            st  = self._sort_state[sec]
 
-            # Background
-            bg = _CLR_ANSYS_BLUE if is_active else Drawing.Color.FromArgb(244, 243, 243)#(234, 234, 234)
-            e.Graphics.FillRectangle(Drawing.SolidBrush(bg), e.Bounds)
+            if st["col"] == e.Column:
+                st["asc"] = not st["asc"]   # same column — flip direction
+            else:
+                st["col"] = e.Column
+                st["asc"] = True            # new column — start ascending
 
-            # Text color
-            fg = Drawing.Color.White if is_active else Drawing.Color.FromArgb(0, 0, 0)
-
-            # Font — bold for active, normal for inactive
-            font = _FONT_NORMAL if is_active else _FONT_NORMAL
-
-            # Draw the label centered in the tab bounds
-            text  = self._tabs.TabPages[e.Index].Text
-            flags = Drawing.StringFormat()
-            flags.Alignment     = Drawing.StringAlignment.Center
-            flags.LineAlignment = Drawing.StringAlignment.Center
-            e.Graphics.DrawString(text, font, Drawing.SolidBrush(fg),
-                                  Drawing.RectangleF(e.Bounds.X, e.Bounds.Y,
-                                                     e.Bounds.Width, e.Bounds.Height),
-                                  flags)
+            self._sort_listview(sec)
+            lv.Invalidate()   # repaint headers to show sort arrow
         except Exception as exc:
-            _log("Tab draw error: " + str(exc))
+            _log("Column click error: " + str(exc))
+
+    def _sort_listview(self, section):
+        """Re-sort the in-memory records for section and repopulate the ListView."""
+        records = self._section_data.get(section, [])
+        if not records:
+            return
+
+        st  = self._sort_state[section]
+        col = st["col"]
+        asc = st["asc"]
+
+        # Map column index to the dict key in each record
+        key_map = {
+            COL_FILENAME:  "label",
+            COL_STATUS:    "status",
+            COL_SIZE:      "size_mb",
+            COL_MODIFIED:  "modified",
+            COL_DATEADDED: "date_added",
+            COL_NOTES:     "notes",
+            COL_FULLPATH:  "source_path",
+        }
+        key = key_map.get(col, "label")
+
+        def sort_key(r):
+            val = r.get(key, "") or ""
+            # Numeric sort for size column
+            if col == COL_SIZE:
+                try:
+                    return float(val)
+                except (ValueError, TypeError):
+                    return 0.0
+            return val.lower()
+
+        sorted_records = sorted(records, key=sort_key, reverse=not asc)
+        self._section_data[section] = sorted_records
+        self._populate_listview(section, sorted_records)
 
     # ── Data / population ─────────────────────────────────────────────────
 
     def _refresh_all(self, sender, e):
-        """Reload all sections from the manifest and repopulate every ListView."""
         try:
             _log("Refresh all sections")
             for sec in repo.ALL_SECTIONS:
                 records = repo.get_section_records(sec)
                 self._section_data[sec] = records
-                self._populate_listview(sec, records)
+                # Re-apply existing sort after refresh
+                self._sort_listview(sec)
 
             total, missing = repo.get_summary_stats()
             self._set_status(
-                u"Loaded \u2014 {0} file(s), {1} missing".format(total, missing)
-            )
+                u"Loaded \u2014 {0} file(s), {1} missing".format(total, missing))
             self._update_tab_labels()
         except Exception as exc:
             _log("Refresh error: " + traceback.format_exc())
@@ -860,22 +869,24 @@ class RepositoryForm(WinForms.Form):
 
     def _populate_listview(self, section, records):
         lv = self._listviews[section]
+
+        # Remember selected paths so we can restore selection after repopulate
         sel_paths = set()
         for item in lv.SelectedItems:
             try:
-                sel_paths.add(item.SubItems[6].Text)
+                sel_paths.add(item.SubItems[COL_FULLPATH].Text)
             except Exception:
                 pass
 
         lv.Items.Clear()
         for r in records:
-            item = lv.Items.Add(r.get("label", "Unnamed"))
+            item   = lv.Items.Add(r.get("label", "Unnamed"))
             status = r.get("status", "?")
             item.SubItems.Add(status)
-            item.SubItems.Add(r.get("size_mb",  "—"))
-            item.SubItems.Add(r.get("modified", "—"))
+            item.SubItems.Add(r.get("size_mb",    u"\u2014"))
+            item.SubItems.Add(r.get("modified",   u"\u2014"))
             item.SubItems.Add(r.get("date_added", ""))
-            item.SubItems.Add(r.get("notes",    ""))
+            item.SubItems.Add(r.get("notes",      ""))
             path = r.get("source_path", "")
             item.SubItems.Add(path)
 
@@ -886,7 +897,6 @@ class RepositoryForm(WinForms.Form):
                 item.ForeColor = Drawing.Color.Black
                 item.Font      = _FONT_NORMAL
 
-            # Restore selection
             if path in sel_paths:
                 item.Selected = True
 
@@ -897,20 +907,20 @@ class RepositoryForm(WinForms.Form):
             missing = sum(1 for r in records if r.get("status") == "MISSING")
             base    = repo.SECTION_LABELS[sec]
             if missing > 0:
-                self._tabs.TabPages[i].Text = u"{0}  [{1}  \u2718{2}]".format(base, total, missing)
+                self._tabs.TabPages[i].Text = u"{0}  [{1}  \u2718{2}]".format(
+                    base, total, missing)
             else:
                 self._tabs.TabPages[i].Text = u"{0}  [{1}]".format(base, total)
 
     def _set_status(self, msg):
         self._status_lbl.Text = msg
 
-    # ── Current section helpers ───────────────────────────────────────────
+    # ── Selection helpers ─────────────────────────────────────────────────
 
     def _current_lv(self):
         return self._listviews.get(self._cur_section)
 
     def _selected_records(self):
-        """Return list of (index, record) tuples for currently selected rows."""
         lv      = self._current_lv()
         records = self._section_data.get(self._cur_section, [])
         result  = []
@@ -920,35 +930,123 @@ class RepositoryForm(WinForms.Form):
                 result.append((idx, records[idx]))
         return result
 
-    # ── Button handlers ───────────────────────────────────────────────────
+    # ── Right-click context menu ──────────────────────────────────────────
+
+    def _on_list_mouse_up(self, s, e):
+        """Show a context menu when the user right-clicks a row."""
+        if e.Button != WinForms.MouseButtons.Right:
+            return
+        try:
+            lv  = s
+            sec = lv.Tag if lv.Tag else self._cur_section
+
+            # Identify the item under the cursor
+            hit = lv.HitTest(e.X, e.Y)
+            if hit.Item is None:
+                return
+
+            # Make sure the clicked row is selected
+            hit.Item.Selected = True
+            lv.Select()
+
+            records = self._section_data.get(sec, [])
+            idx     = hit.Item.Index
+            if idx < 0 or idx >= len(records):
+                return
+            record  = records[idx]
+            missing = record.get("status") == "MISSING"
+
+            menu = WinForms.ContextMenuStrip()
+
+            item_open = menu.Items.Add(u"\u25B6  Open")
+            item_open.Enabled = not missing
+            item_open.Click  += lambda s2, e2: self._on_open(None, None)
+
+            item_notes = menu.Items.Add(u"\u270E  Edit Notes")
+            item_notes.Click += lambda s2, e2: self._on_notes(None, None)
+
+            menu.Items.Add(WinForms.ToolStripSeparator())
+
+            # Relink — only shown/enabled when file is MISSING
+            item_relink = menu.Items.Add(u"\u27A1  Relink Missing File\u2026")
+            item_relink.Enabled = missing
+            # Capture idx and sec for the lambda
+            _idx = idx
+            _sec = sec
+            item_relink.Click += lambda s2, e2: self._on_relink(_sec, _idx)
+
+            menu.Items.Add(WinForms.ToolStripSeparator())
+
+            item_remove = menu.Items.Add(u"\u2716  Remove from Repository")
+            item_remove.Click += lambda s2, e2: self._on_remove(None, None)
+
+            menu.Show(lv, Drawing.Point(e.X, e.Y))
+
+        except Exception as exc:
+            _log("Context menu error: " + str(exc))
+
+    # ── Relink missing file ───────────────────────────────────────────────
+
+    def _on_relink(self, section, index):
+        """
+        Let the user browse for the new location of a missing file and
+        update the stored path in the manifest.
+        """
+        try:
+            records = self._section_data.get(section, [])
+            if index < 0 or index >= len(records):
+                return
+            record   = records[index]
+            old_path = record.get("source_path", "")
+            old_name = os.path.basename(old_path) if old_path else ""
+
+            dlg = WinForms.OpenFileDialog()
+            dlg.Title    = u"Relink: locate \"{0}\"".format(old_name)
+            dlg.Filter   = "All Files (*.*)|*.*"
+            dlg.FileName = old_name   # pre-fill with the old filename
+
+            if dlg.ShowDialog() != WinForms.DialogResult.OK:
+                return
+
+            new_path = dlg.FileName
+            _log("Relinking [{0}] index {1}: {2} -> {3}".format(
+                section, index, old_path, new_path))
+
+            # Update the manifest via the helper
+            repo.relink_file_record(section, index, new_path)
+
+            self._refresh_all(None, None)
+            self._set_status(u"Relinked: {0}".format(os.path.basename(new_path)))
+
+        except Exception as exc:
+            _log("Relink error: " + str(exc))
+            WinForms.MessageBox.Show("Relink failed:\n" + str(exc), "Error")
+
+    # ── Toolbar button handlers ───────────────────────────────────────────
 
     def _on_add(self, sender, e):
         try:
             _log("Add File clicked for section: " + self._cur_section)
             dlg = WinForms.OpenFileDialog()
-            dlg.Multiselect  = True
-            dlg.Title        = "Add File(s) to {0}".format(
+            dlg.Multiselect = True
+            dlg.Title       = "Add File(s) to {0}".format(
                 repo.SECTION_LABELS.get(self._cur_section, self._cur_section))
-            dlg.Filter = (
-                "All Files (*.*)|*.*|"
-                "Workbench Projects (*.wbpj;*.wbpz)|*.wbpj;*.wbpz|"
-                "Spreadsheets (*.xlsx;*.xls;*.xlsm)|*.xlsx;*.xls;*.xlsm|"
-                "PDF Files (*.pdf)|*.pdf|"
-                "Text / Data (*.txt;*.csv;*.json)|*.txt;*.csv;*.json"
-            )
+            dlg.Filter = ("All Files (*.*)|*.*|"
+                          "Workbench Projects (*.wbpj;*.wbpz)|*.wbpj;*.wbpz|"
+                          "Spreadsheets (*.xlsx;*.xls;*.xlsm)|*.xlsx;*.xls;*.xlsm|"
+                          "PDF Files (*.pdf)|*.pdf|"
+                          "Text / Data (*.txt;*.csv;*.json)|*.txt;*.csv;*.json")
             if dlg.ShowDialog() == WinForms.DialogResult.OK:
-                added = 0
-                skipped = 0
+                added = skipped = 0
                 for path in dlg.FileNames:
-                    result = repo.add_file_record(self._cur_section, path)
-                    if result:
+                    if repo.add_file_record(self._cur_section, path):
                         added += 1
                     else:
                         skipped += 1
                 self._refresh_all(None, None)
                 self._set_status(
-                    u"Added {0} file(s). {1} duplicate(s) skipped.".format(added, skipped)
-                )
+                    u"Added {0} file(s). {1} duplicate(s) skipped.".format(
+                        added, skipped))
         except Exception as exc:
             _log("Add error: " + traceback.format_exc())
             WinForms.MessageBox.Show("Add failed:\n" + str(exc), "Error")
@@ -976,15 +1074,13 @@ class RepositoryForm(WinForms.Form):
                 return
             names = "\n".join(r.get("label", "?") for _, r in sel)
             if WinForms.MessageBox.Show(
-                    "Remove {0} file(s) from the repository?\n\n{1}".format(len(sel), names),
+                    "Remove {0} file(s) from the repository?\n\n{1}".format(
+                        len(sel), names),
                     "Confirm Remove",
                     WinForms.MessageBoxButtons.YesNo) != WinForms.DialogResult.Yes:
                 return
-
-            # Remove in reverse index order to avoid index shifting
             for idx, _ in sorted(sel, key=lambda t: t[0], reverse=True):
                 repo.remove_file_record(self._cur_section, idx)
-
             self._refresh_all(None, None)
         except Exception as exc:
             _log("Remove error: " + traceback.format_exc())
@@ -1008,8 +1104,7 @@ class RepositoryForm(WinForms.Form):
         try:
             self._set_status("Running health check...")
             health = repo.run_health_check()
-            dlg = HealthCheckDialog(health)
-            dlg.ShowDialog()
+            HealthCheckDialog(health).ShowDialog()
             self._set_status("Health check complete.")
         except Exception as exc:
             _log("Health check error: " + str(exc))
@@ -1017,37 +1112,30 @@ class RepositoryForm(WinForms.Form):
 
 
 # ────────────────────────────────────────────────────────────────────────────
-#  Shared form-launch helper
+#  Form launcher
 # ────────────────────────────────────────────────────────────────────────────
 
 def _launch_repository_form(task=None):
-    """
-    Resolve project directory, configure the backend, and show the form.
-    Safe to call from any ACT callback.
-    """
     try:
         _log("=== Launching Repository Form ===")
-
         user_files_dir = _resolve_project_dir(task)
 
         if not user_files_dir:
-            # Do NOT fall back to TEMP — that caused the shared-manifest bug.
             WinForms.MessageBox.Show(
                 "No saved Workbench project was found.\n\n"
                 "Please save your project first:\n"
-                "    File  \u2192  Save As\u2026\n\n"
+                u"    File  \u2192  Save As\u2026\n\n"
                 "Then click the Analysis Repository button again.\n\n"
-                "Each project must be saved before its repository can be created,\n"
-                "so that the manifest is stored alongside the project files.",
-                "Analysis Hub \u2014 Save Project First",
+                "Each project must be saved before its repository can be "
+                "created, so that the manifest is stored alongside the "
+                "project files.",
+                u"Analysis Hub \u2014 Save Project First",
                 WinForms.MessageBoxButtons.OK,
                 WinForms.MessageBoxIcon.Information)
-            return   # <-- exit cleanly, no form shown, no TEMP manifest created
+            return
 
         repo.set_base_directory(user_files_dir)
-
-        form = RepositoryForm(task)
-        form.ShowDialog()
+        RepositoryForm(task).ShowDialog()
 
     except Exception as exc:
         _log("_launch_repository_form error:\n" + traceback.format_exc())
@@ -1066,49 +1154,31 @@ def _launch_repository_form(task=None):
 # ────────────────────────────────────────────────────────────────────────────
 
 def init(ext):
-    """Called once when the extension is loaded by Workbench."""
     try:
-        # Log is already reset at module load time (see top of this file).
-        # Just record the install directory for diagnostics.
         _log("Extension init: InstallDir = " + ext.InstallDir)
-
-        # Ensure the AnalysisHub subfolder is on the import path
         ext_subdir = os.path.join(ext.InstallDir, "AnalysisHub")
         if ext_subdir not in sys.path:
             sys.path.insert(0, ext_subdir)
-
     except Exception as exc:
         _log("init error: " + str(exc))
 
 
-# ────────────────────────────────────────────────────────────────────────────
-#  ACT Task Callbacks  (workflow task: "RepositoryTask")
-# ────────────────────────────────────────────────────────────────────────────
-
 def task_initialize(task):
-    """
-    Called the first time an Analysis Hub system is placed on the schematic.
-    Set default property values here.
-    """
     try:
         _log("task_initialize: " + task.Name)
-        task.Properties["ProjectTitle"].Value = ""
-        task.Properties["Customer"].Value     = ""
-        task.Properties["Analyst"].Value      = ""
+        task.Properties["ProjectTitle"].Value  = ""
+        task.Properties["Customer"].Value      = ""
+        task.Properties["Analyst"].Value       = ""
         task.Properties["ProjectStatus"].Value = "Active"
-        task.Properties["Revision"].Value     = "Rev 0"
-        task.Properties["TotalFiles"].Value   = "0"
-        task.Properties["MissingFiles"].Value = "0"
-        task.Properties["LastRefresh"].Value  = "Never"
+        task.Properties["Revision"].Value      = "Rev 0"
+        task.Properties["TotalFiles"].Value    = "0"
+        task.Properties["MissingFiles"].Value  = "0"
+        task.Properties["LastRefresh"].Value   = "Never"
     except Exception as exc:
         _log("task_initialize error: " + str(exc))
 
 
 def task_edit(task):
-    """
-    Called when the user right-clicks the Repository cell and chooses Edit,
-    or double-clicks the cell.  Opens the Repository Manager UI.
-    """
     try:
         _log("task_edit called")
         _launch_repository_form(task)
@@ -1118,10 +1188,6 @@ def task_edit(task):
 
 
 def task_update(task):
-    """
-    Called when the user clicks 'Update' on the task.
-    Refresh statistics and sync back to task properties.
-    """
     try:
         _log("task_update called")
         user_files_dir = _resolve_project_dir(task)
@@ -1133,7 +1199,6 @@ def task_update(task):
 
 
 def task_refresh(task):
-    """Called when the Project Schematic is refreshed."""
     try:
         _log("task_refresh called")
         task_update(task)
@@ -1142,31 +1207,20 @@ def task_refresh(task):
 
 
 def task_reset(task):
-    """Called when the task is reset."""
-    try:
-        _log("task_reset called")
-    except Exception as exc:
-        _log("task_reset error: " + str(exc))
+    _log("task_reset called")
 
 
 def task_status(task):
-    """
-    Called by Workbench to determine the cell state icon.
-    Returns [state_string, tooltip_string].
-    Valid states: "Unfulfilled", "UpToDate", "Refresh Required",
-                  "Update Required", "Interrupted", "Pending"
-    """
     try:
-        # Quick check without I/O if no project dir is set
         user_files_dir = _resolve_project_dir(task)
         if not user_files_dir:
-            return ["Unfulfilled", "No project directory found — please save the project"]
-
+            return ["Unfulfilled",
+                    "No project directory found — please save the project"]
         repo.set_base_directory(user_files_dir)
         total, missing = repo.get_summary_stats()
-
         if total == 0:
-            return ["Unfulfilled", "Repository is empty — add files to get started"]
+            return ["Unfulfilled",
+                    "Repository is empty — add files to get started"]
         elif missing > 0:
             return ["Refresh Required",
                     "{0} file(s) missing from repository".format(missing)]
@@ -1179,7 +1233,6 @@ def task_status(task):
 
 
 def task_report(task, report):
-    """Called when Workbench generates a project report."""
     try:
         _log("task_report called")
         total, missing = repo.get_summary_stats()
@@ -1187,13 +1240,13 @@ def task_report(task, report):
         lines = [
             "Analysis Repository Report",
             "---------------------------",
-            "Project: " + info.get("title",    "—"),
-            "Customer: " + info.get("customer", "—"),
-            "Analyst: "  + info.get("analyst",  "—"),
-            "Status: "   + info.get("status",   "—"),
-            "Revision: " + info.get("revision", "—"),
+            "Project:  " + info.get("title",    u"\u2014"),
+            "Customer: " + info.get("customer", u"\u2014"),
+            "Analyst:  " + info.get("analyst",  u"\u2014"),
+            "Status:   " + info.get("status",   u"\u2014"),
+            "Revision: " + info.get("revision", u"\u2014"),
             "",
-            "Total files: {0}".format(total),
+            "Total files:   {0}".format(total),
             "Missing files: {0}".format(missing),
         ]
         report.AddLine("\n".join(lines))
@@ -1202,16 +1255,10 @@ def task_report(task, report):
 
 
 def task_delete(task):
-    """Called when the Analysis Hub system is deleted from the schematic."""
     _log("task_delete called")
 
 
-# ────────────────────────────────────────────────────────────────────────────
-#  Context-menu callbacks
-# ────────────────────────────────────────────────────────────────────────────
-
 def context_refresh(task):
-    """Right-click → Refresh Repository."""
     try:
         _log("context_refresh called")
         user_files_dir = _resolve_project_dir(task)
@@ -1220,35 +1267,25 @@ def context_refresh(task):
         _sync_task_properties(task)
         total, missing = repo.get_summary_stats()
         WinForms.MessageBox.Show(
-            u"Repository refreshed.\nTotal: {0}   Missing: {1}".format(total, missing),
-            "Analysis Hub — Refresh")
+            u"Repository refreshed.\nTotal: {0}   Missing: {1}".format(
+                total, missing),
+            "Analysis Hub \u2014 Refresh")
     except Exception as exc:
         _log("context_refresh error: " + str(exc))
 
 
 def context_health_check(task):
-    """Right-click → Run Health Check."""
     try:
         _log("context_health_check called")
         user_files_dir = _resolve_project_dir(task)
         if user_files_dir:
             repo.set_base_directory(user_files_dir)
-        health = repo.run_health_check()
-        dlg = HealthCheckDialog(health)
-        dlg.ShowDialog()
+        HealthCheckDialog(repo.run_health_check()).ShowDialog()
     except Exception as exc:
         _log("context_health_check error: " + str(exc))
 
 
-# ────────────────────────────────────────────────────────────────────────────
-#  Toolbar callback  (Project Schematic toolbar button)
-# ────────────────────────────────────────────────────────────────────────────
-
 def toolbar_open_repository(task=None):
-    """
-    Toolbar button 'Analysis Repository' — opens the manager without
-    requiring the system to exist on the schematic.
-    """
     try:
         _log("toolbar_open_repository called")
         _launch_repository_form(task)
@@ -1261,7 +1298,6 @@ def toolbar_open_repository(task=None):
 # ────────────────────────────────────────────────────────────────────────────
 
 def _sync_task_properties(task):
-    """Write live stats back to the task's Details-pane properties."""
     try:
         user_files_dir = _resolve_project_dir(task)
         if not user_files_dir:
@@ -1271,11 +1307,11 @@ def _sync_task_properties(task):
         total, missing = repo.get_summary_stats()
         info = repo.get_project_info()
 
-        task.Properties["TotalFiles"].Value   = str(total)
+        task.Properties["TotalFiles"].Value  = str(total)
         task.Properties["MissingFiles"].Value = str(missing)
-        task.Properties["LastRefresh"].Value  = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        task.Properties["LastRefresh"].Value = datetime.datetime.now().strftime(
+            "%Y-%m-%d %H:%M")
 
-        # Sync project-info properties from manifest
         for field, prop in [("title",    "ProjectTitle"),
                              ("customer", "Customer"),
                              ("analyst",  "Analyst"),
@@ -1287,6 +1323,5 @@ def _sync_task_properties(task):
                     task.Properties[prop].Value = val
                 except Exception:
                     pass
-
     except Exception as exc:
         _log("_sync_task_properties error: " + str(exc))
