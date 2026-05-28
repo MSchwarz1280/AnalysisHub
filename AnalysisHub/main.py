@@ -200,6 +200,7 @@ _CLR_READY       = Drawing.Color.FromArgb(16, 124,  16)   # green
 _CLR_MISSING     = Drawing.Color.FromArgb(209,  52,  56)  # red
 _CLR_ROW_ALT     = Drawing.Color.FromArgb(245, 247, 250)  # very light blue-grey
 _CLR_SECTION_HDR = Drawing.Color.FromArgb(220, 230, 245)  # section separator
+_CLR_COL_HEADER  = Drawing.Color.FromArgb(240, 242, 245)  # column header background
 
 _FONT_NORMAL = Drawing.Font("Segoe UI",  9.5)
 _FONT_BOLD   = Drawing.Font("Segoe UI",  9.5, Drawing.FontStyle.Bold)
@@ -713,11 +714,19 @@ class RepositoryForm(WinForms.Form):
 
     def _make_listview(self):
         lv = WinForms.ListView()
-        lv.View          = WinForms.View.Details
-        lv.FullRowSelect  = True
-        lv.GridLines      = True
-        lv.MultiSelect    = True
-        lv.Font           = _FONT_BOLD
+        lv.View         = WinForms.View.Details
+        lv.FullRowSelect = True
+        lv.GridLines     = True
+        lv.MultiSelect   = True
+        lv.Font          = _FONT_NORMAL
+        lv.BorderStyle   = WinForms.BorderStyle.FixedSingle
+
+        # Owner-draw the column headers so we can set background
+        # color and draw the bottom separator line ourselves
+        lv.OwnerDraw          = True
+        lv.DrawColumnHeader  += self._on_draw_column_header
+        lv.DrawItem          += self._on_draw_item
+        lv.DrawSubItem       += self._on_draw_subitem
 
         cols = [
             ("File Name",   380),
@@ -754,7 +763,48 @@ class RepositoryForm(WinForms.Form):
             avail = 100
         self._tabs.Location = Drawing.Point(16, top)
         self._tabs.Size     = Drawing.Size(self.ClientSize.Width - 32, avail)
+        
+    def _on_draw_column_header(self, s, e):
+        """Paint column headers with a grey background and a bold bottom border line."""
+        try:
+            # Fill header background
+            e.Graphics.FillRectangle(
+                Drawing.SolidBrush(_CLR_COL_HEADER), e.Bounds)
 
+            # Draw the column header text, left-aligned with a small indent
+            text_rect = Drawing.RectangleF(
+                e.Bounds.X + 6, e.Bounds.Y,
+                e.Bounds.Width - 6, e.Bounds.Height)
+            fmt = Drawing.StringFormat()
+            fmt.LineAlignment = Drawing.StringAlignment.Center
+            e.Graphics.DrawString(
+                e.Header.Text, _FONT_BOLD,
+                Drawing.SolidBrush(Drawing.Color.FromArgb(33, 37, 41)),
+                text_rect, fmt)
+
+            # Draw right-side column divider (light grey)
+            pen_div = Drawing.Pen(Drawing.Color.FromArgb(200, 200, 200), 1)
+            e.Graphics.DrawLine(pen_div,
+                e.Bounds.Right - 1, e.Bounds.Top,
+                e.Bounds.Right - 1, e.Bounds.Bottom)
+
+            # Draw the bold bottom border line (the separator you want)
+            pen_sep = Drawing.Pen(Drawing.Color.FromArgb(160, 160, 165), 2)
+            e.Graphics.DrawLine(pen_sep,
+                e.Bounds.Left, e.Bounds.Bottom - 1,
+                e.Bounds.Right, e.Bounds.Bottom - 1)
+
+        except Exception as exc:
+            _log("Draw column header error: " + str(exc))
+
+    def _on_draw_item(self, s, e):
+        """Required by OwnerDraw — let the default drawing handle items."""
+        e.DrawDefault = True
+
+    def _on_draw_subitem(self, s, e):
+        """Required by OwnerDraw — let the default drawing handle subitems."""
+        e.DrawDefault = True
+        
     def _on_tab_changed(self, s, e):
         idx = self._tabs.SelectedIndex
         if 0 <= idx < len(repo.ALL_SECTIONS):
