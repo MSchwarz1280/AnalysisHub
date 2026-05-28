@@ -674,6 +674,9 @@ class RepositoryForm(WinForms.Form):
                                WinForms.AnchorStyles.Right)
         self._tabs.Font     = _FONT_NORMAL
         self._tabs.SelectedIndexChanged += self._on_tab_changed
+        self._tabs.DrawMode = WinForms.TabDrawMode.OwnerDrawFixed
+        self._tabs.DrawItem += self._on_draw_tab
+        self._tabs.Font     = _FONT_NORMAL
 
         self._listviews = {}
 
@@ -756,6 +759,34 @@ class RepositoryForm(WinForms.Form):
         idx = self._tabs.SelectedIndex
         if 0 <= idx < len(repo.ALL_SECTIONS):
             self._cur_section = repo.ALL_SECTIONS[idx]
+            self._tabs.Invalidate()
+
+    def _on_draw_tab(self, s, e):
+        """Custom tab painter — highlights the active tab in blue, greys out inactive."""
+        try:
+            is_active = (e.Index == self._tabs.SelectedIndex)
+
+            # Background
+            bg = _CLR_ANSYS_BLUE if is_active else Drawing.Color.FromArgb(244, 243, 243)#(234, 234, 234)
+            e.Graphics.FillRectangle(Drawing.SolidBrush(bg), e.Bounds)
+
+            # Text color
+            fg = Drawing.Color.White if is_active else Drawing.Color.FromArgb(0, 0, 0)
+
+            # Font — bold for active, normal for inactive
+            font = _FONT_NORMAL if is_active else _FONT_NORMAL
+
+            # Draw the label centered in the tab bounds
+            text  = self._tabs.TabPages[e.Index].Text
+            flags = Drawing.StringFormat()
+            flags.Alignment     = Drawing.StringAlignment.Center
+            flags.LineAlignment = Drawing.StringAlignment.Center
+            e.Graphics.DrawString(text, font, Drawing.SolidBrush(fg),
+                                  Drawing.RectangleF(e.Bounds.X, e.Bounds.Y,
+                                                     e.Bounds.Width, e.Bounds.Height),
+                                  flags)
+        except Exception as exc:
+            _log("Tab draw error: " + str(exc))
 
     # ── Data / population ─────────────────────────────────────────────────
 
