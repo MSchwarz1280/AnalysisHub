@@ -2,29 +2,27 @@
 """
 main.py  —  AnalysisHub ACT Extension  (Entry Point)
 =====================================================
-Implements all ACT callbacks (task lifecycle, context menus, toolbar)
-and defines the WinForms-based Repository Manager UI.
+IronPython 2.7 / ANSYS Workbench 2024 R2+
 
-Environment: IronPython 2.7 inside ANSYS Workbench 2024 R2 (v242)+
-             .NET 4.x / System.Windows.Forms available via clr.
-
-Key design rules
-----------------
-* All UI is built with System.Windows.Forms — no external dependencies.
-* Backend logic lives exclusively in repository_helpers.py.
-* Every public function is try/except-wrapped and writes to the debug log.
-* IronPython 2.7 syntax: no f-strings, no Python-3-only builtins.
-
-Cumulative changes
-------------------
-* Project directory resolved via Project.GetProjectFile() (ANSYS documented API)
-* Log resets at module load time so Reload Extension always gives a clean log
-* Column header sort — click any column to sort; each tab independent
-* Right-click context menu — Open, Edit Notes, Relink Missing File, Remove
-* Relink missing files from both the main list and the Health Check dialog
-* Active tab painted blue/bold; inactive tabs grey
-* Tab padding and fixed height for readability
-* Bold column headers; HeaderStyle.Clickable for sort support
+Cumulative changes in this version
+-----------------------------------
+* Archive feature:
+  - Status dropdown "Archived" triggers archive workflow
+  - ArchiveDialog: checklist of all eligible files with sizes,
+    Check All / Uncheck All, .wbpj options panel, 1 GB warnings
+  - Regular files: copied via shutil.copy2
+  - .wbpj files: archived via RunWB2 batch process (Open->Archive->exit)
+    OR copied with _files folder — user chooses
+  - Progress dialog shown while RunWB2 batch runs
+  - Manifest updated with archive_path, archive_date, archive_src_mtime
+  - Main list Status column shows: Ready / Archived ✔ / Archived ✘ / MISSING
+  - Toolbar "Archive Files" button — accessible at any time
+  - Open-project .wbpj excluded from archive candidates automatically
+* Health Check dialog with inline Relink
+* Column sort per tab
+* Right-click context menu with Relink
+* Active tab blue/bold drawing, tab padding
+* Bold column headers, HeaderStyle.Clickable
 """
 
 import os
@@ -51,7 +49,7 @@ except Exception:
 import repository_helpers as repo
 
 # ────────────────────────────────────────────────────────────────────────────
-#  Logging — reset at module load so Reload Extension clears the log
+#  Logging
 # ────────────────────────────────────────────────────────────────────────────
 
 LOG_PATH = r"C:\Temp\AnalysisHub_debug.log"
@@ -59,7 +57,7 @@ LOG_PATH = r"C:\Temp\AnalysisHub_debug.log"
 try:
     with open(LOG_PATH, "w") as _fh:
         _fh.write("=" * 80 + "\n")
-        _fh.write("  AnalysisHub  -  Module loaded / reloaded: {0}\n".format(
+        _fh.write("  AnalysisHub  -  Module loaded: {0}\n".format(
             datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
         _fh.write("=" * 80 + "\n")
 except Exception:
@@ -82,7 +80,6 @@ def _log(msg):
 # ────────────────────────────────────────────────────────────────────────────
 
 def _resolve_project_dir(task=None):
-    """Return the user_files path for the open project, or None."""
     try:
         wbpj_path = Project.GetProjectFile()
         if wbpj_path and wbpj_path.strip():
@@ -90,7 +87,7 @@ def _resolve_project_dir(task=None):
             proj_dir   = wbpj_path[:wbpj_path.rfind("\\")]
             proj_name  = wbpj_path[wbpj_path.rfind("\\") + 1:-5]
             user_files = proj_dir + "\\" + proj_name + "_files\\user_files"
-            _log("Resolved user_files via Project.GetProjectFile(): " + user_files)
+            _log("Resolved user_files: " + user_files)
             if os.path.exists(proj_dir):
                 return user_files
     except Exception as exc:
@@ -100,10 +97,9 @@ def _resolve_project_dir(task=None):
         try:
             ad = task.ActiveDirectory
             if ad and os.path.isdir(ad):
-                _log("Resolved via task.ActiveDirectory: " + ad)
                 return ad
-        except Exception as exc:
-            _log("task.ActiveDirectory failed: " + str(exc))
+        except Exception:
+            pass
 
     try:
         for tg in ExtAPI.DataModel.TaskGroups:
@@ -111,12 +107,46 @@ def _resolve_project_dir(task=None):
                 for t in tg.Tasks:
                     ad = t.ActiveDirectory
                     if ad and os.path.isdir(ad):
-                        _log("Resolved via DataModel task: " + ad)
                         return ad
-    except Exception as exc:
-        _log("DataModel scan failed: " + str(exc))
+    except Exception:
+        pass
 
     _log("WARNING: No saved project found.")
+    return None
+
+
+def _get_open_project_path():
+    """Return the full path of the currently open .wbpj, or None."""
+    try:
+        p = Project.GetProjectFile()
+        if p and p.strip():
+            return p.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _get_runwb2_path():
+    """Locate RunWB2.exe for the current ANSYS installation."""
+    try:
+        install_root = (Ansys.Utilities.ApplicationConfiguration
+                        .DefaultConfiguration.AwpRootEnvironmentVariableValue)
+        platform     = (Ansys.Utilities.ApplicationConfiguration
+                        .DefaultConfiguration.Platform)
+        runwb2 = System.IO.Path.Combine(
+            install_root, "Framework", "bin", platform, "runwb2.exe")
+        if System.IO.File.Exists(runwb2):
+            return runwb2
+    except Exception as exc:
+        _log("_get_runwb2_path error: " + str(exc))
+
+    # Common fallback paths
+    for candidate in [
+        r"C:\Program Files\ANSYS Inc\v242\Framework\bin\Win64\RunWB2.exe",
+        r"C:\Program Files\ANSYS Inc\v251\Framework\bin\Win64\RunWB2.exe",
+    ]:
+        if os.path.exists(candidate):
+            return candidate
     return None
 
 
@@ -129,33 +159,23 @@ def _smart_open_file(path):
         _log("Open failed - file does not exist: " + str(path))
         return False
     ext = os.path.splitext(path)[1].lower()
-    _log("Opening: {0}  (ext={1})".format(path, ext))
     try:
         if ext in (".wbpj", ".wbpz"):
-            try:
-                install_root = Ansys.Utilities.ApplicationConfiguration.DefaultConfiguration.AwpRootEnvironmentVariableValue
-                platform     = Ansys.Utilities.ApplicationConfiguration.DefaultConfiguration.Platform
-                runwb2       = System.IO.Path.Combine(install_root, "Framework", "bin", platform, "runwb2.exe")
-                if System.IO.File.Exists(runwb2):
-                    info = System.Diagnostics.ProcessStartInfo()
-                    info.FileName        = runwb2
-                    info.Arguments       = '-F "{0}"'.format(path)
-                    info.UseShellExecute = False
-                    System.Diagnostics.Process.Start(info)
-                    _log("Opened .wbpj with runwb2")
-                    return True
-            except Exception as exc:
-                _log("runwb2 launch error: " + str(exc))
-
-        if ext in (".txt", ".py", ".log", ".csv", ".md", ".xml", ".json", ".ini", ".bat"):
-            notepadpp = r"C:\Program Files\Notepad++\notepad++.exe"
-            if os.path.exists(notepadpp):
-                System.Diagnostics.Process.Start(notepadpp, '"{0}"'.format(path))
-                _log("Opened with Notepad++")
+            runwb2 = _get_runwb2_path()
+            if runwb2:
+                info = System.Diagnostics.ProcessStartInfo()
+                info.FileName        = runwb2
+                info.Arguments       = '-F "{0}"'.format(path)
+                info.UseShellExecute = False
+                System.Diagnostics.Process.Start(info)
                 return True
-
+        if ext in (".txt", ".py", ".log", ".csv", ".md",
+                   ".xml", ".json", ".ini", ".bat"):
+            npp = r"C:\Program Files\Notepad++\notepad++.exe"
+            if os.path.exists(npp):
+                System.Diagnostics.Process.Start(npp, '"{0}"'.format(path))
+                return True
         os.startfile(path)
-        _log("Opened with default application")
         return True
     except Exception as exc:
         _log("_smart_open_file error: " + str(exc))
@@ -168,21 +188,22 @@ def _smart_open_file(path):
 
 
 # ────────────────────────────────────────────────────────────────────────────
-#  UI colours / fonts / column index constants
+#  UI colours / fonts / column constants
 # ────────────────────────────────────────────────────────────────────────────
 
-_CLR_ANSYS_BLUE  = Drawing.Color.FromArgb(0,  120, 212)
-_CLR_READY       = Drawing.Color.FromArgb(16, 124,  16)
+_CLR_ANSYS_BLUE  = Drawing.Color.FromArgb(0,   120, 212)
+_CLR_READY       = Drawing.Color.FromArgb(16,  124,  16)
 _CLR_MISSING     = Drawing.Color.FromArgb(209,  52,  56)
+_CLR_ARCHIVED_OK = Drawing.Color.FromArgb(0,   102, 204)   # blue
+_CLR_ARCHIVED_OLD= Drawing.Color.FromArgb(200, 100,   0)   # orange
 _CLR_ROW_ALT     = Drawing.Color.FromArgb(245, 247, 250)
-_CLR_SECTION_HDR = Drawing.Color.FromArgb(220, 230, 245)
+_CLR_WARN_BG     = Drawing.Color.FromArgb(255, 244, 206)   # pale amber
 
 _FONT_NORMAL = Drawing.Font("Segoe UI",  9.5)
 _FONT_BOLD   = Drawing.Font("Segoe UI",  9.5, Drawing.FontStyle.Bold)
 _FONT_TITLE  = Drawing.Font("Segoe UI", 13,   Drawing.FontStyle.Bold)
 _FONT_SMALL  = Drawing.Font("Segoe UI",  8.5)
 
-# Column index constants
 COL_FILENAME  = 0
 COL_STATUS    = 1
 COL_SIZE      = 2
@@ -190,6 +211,8 @@ COL_MODIFIED  = 3
 COL_DATEADDED = 4
 COL_NOTES     = 5
 COL_FULLPATH  = 6
+
+SIZE_WARN_BYTES = 1024 * 1024 * 1024   # 1 GB
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -246,8 +269,10 @@ class NotesDialog(WinForms.Form):
         self._tb.Text       = current_notes
         self.Controls.Add(self._tb)
 
-        self.Controls.Add(_make_btn("OK",     260, 185, 90, 32, primary=True, handler=self._ok))
-        self.Controls.Add(_make_btn("Cancel", 360, 185, 90, 32, handler=self._cancel))
+        self.Controls.Add(_make_btn("OK",     260, 185, 90, 32,
+                                    primary=True, handler=self._ok))
+        self.Controls.Add(_make_btn("Cancel", 360, 185, 90, 32,
+                                    handler=self._cancel))
 
     def _ok(self, s, e):
         self.result_notes = self._tb.Text
@@ -300,14 +325,17 @@ class RevisionDialog(WinForms.Form):
         self._tb_note.Size      = Drawing.Size(420, 68)
         self.Controls.Add(self._tb_note)
 
-        self.Controls.Add(_make_btn("Save",   240, 172, 90, 32, primary=True, handler=self._ok))
-        self.Controls.Add(_make_btn("Cancel", 340, 172, 90, 32, handler=self._cancel))
+        self.Controls.Add(_make_btn("Save",   240, 172, 90, 32,
+                                    primary=True, handler=self._ok))
+        self.Controls.Add(_make_btn("Cancel", 340, 172, 90, 32,
+                                    handler=self._cancel))
 
     def _ok(self, s, e):
         self.result_rev  = self._tb_rev.Text.strip()
         self.result_note = self._tb_note.Text.strip()
         if not self.result_rev:
-            WinForms.MessageBox.Show("Please enter a revision label.", "Validation")
+            WinForms.MessageBox.Show("Please enter a revision label.",
+                                     "Validation")
             return
         self.DialogResult = WinForms.DialogResult.OK
         self.Close()
@@ -318,7 +346,7 @@ class RevisionDialog(WinForms.Form):
 
 
 # ────────────────────────────────────────────────────────────────────────────
-#  Health-check dialog  (with inline Relink support)
+#  Health-check dialog  (with inline Relink)
 # ────────────────────────────────────────────────────────────────────────────
 
 class HealthCheckDialog(WinForms.Form):
@@ -336,8 +364,11 @@ class HealthCheckDialog(WinForms.Form):
         total   = health["total"]
         missing = health["missing"]
         ready   = health["ready"]
+        arch_ok = health.get("archived_ok", 0)
+        arch_old= health.get("archived_old", 0)
         colour  = _CLR_MISSING if missing > 0 else _CLR_READY
-        icon    = u"\u2718 ISSUES FOUND" if missing > 0 else u"\u2714 ALL FILES OK"
+        icon    = (u"\u2718 ISSUES FOUND" if missing > 0
+                   else u"\u2714 ALL FILES OK")
 
         lbl_icon = WinForms.Label()
         lbl_icon.Text      = icon
@@ -348,15 +379,17 @@ class HealthCheckDialog(WinForms.Form):
         self.Controls.Add(lbl_icon)
 
         lbl_sum = WinForms.Label()
-        lbl_sum.Text     = "Total: {0}   Ready: {1}   Missing: {2}".format(
-            total, ready, missing)
+        lbl_sum.Text = ("Total: {0}   Ready: {1}   Missing: {2}   "
+                        "Archived OK: {3}   Archived Outdated: {4}".format(
+                            total, ready, missing, arch_ok, arch_old))
         lbl_sum.Location = Drawing.Point(16, 46)
         lbl_sum.AutoSize = True
         self.Controls.Add(lbl_sum)
 
         if missing > 0:
             lbl_hint = WinForms.Label()
-            lbl_hint.Text      = u"Select a missing file and click \u27A1 Relink to locate it."
+            lbl_hint.Text = (u"Select a missing file and click "
+                             u"\u27A1 Relink to locate it.")
             lbl_hint.Font      = _FONT_SMALL
             lbl_hint.ForeColor = Drawing.Color.Gray
             lbl_hint.Location  = Drawing.Point(16, 66)
@@ -393,68 +426,53 @@ class HealthCheckDialog(WinForms.Form):
             handler=self._on_relink)
         self._btn_relink.Enabled = (missing > 0)
         self.Controls.Add(self._btn_relink)
-
         self._lv.SelectedIndexChanged += self._on_selection_changed
 
-        self.Controls.Add(_make_btn("Close", 620, 440, 100, 32, primary=True,
+        self.Controls.Add(_make_btn("Close", 620, 440, 100, 32,
+                                    primary=True,
                                     handler=lambda s, e: self.Close()))
 
     def _on_selection_changed(self, s, e):
-        """Enable Relink only when exactly one row is selected."""
         self._btn_relink.Enabled = (self._lv.SelectedItems.Count == 1)
 
     def _on_relink(self, s, e):
-        """Browse for the new location of the selected missing file."""
         try:
             if self._lv.SelectedItems.Count != 1:
                 return
-
             selected = self._lv.SelectedItems[0]
             label    = selected.SubItems[1].Text
             old_path = selected.SubItems[2].Text
             old_name = os.path.basename(old_path) if old_path else label
-
             section, index = self._find_record(label, old_path)
             if section is None:
                 WinForms.MessageBox.Show(
-                    "Could not locate this record in the manifest.\n"
-                    "Close and use Refresh, then try again.",
-                    "Relink Error")
+                    "Could not locate this record.\n"
+                    "Close and Refresh, then try again.", "Relink Error")
                 return
-
             dlg = WinForms.OpenFileDialog()
             dlg.Title    = u"Relink: locate \"{0}\"".format(old_name)
             dlg.Filter   = "All Files (*.*)|*.*"
             dlg.FileName = old_name
-
             if dlg.ShowDialog() != WinForms.DialogResult.OK:
                 return
-
             new_path = dlg.FileName
             repo.relink_file_record(section, index, new_path)
-            _log("Health check relink: {0} -> {1}".format(old_path, new_path))
-
-            # Update the row in place — no need to close and reopen
             selected.SubItems[2].Text = new_path
             selected.SubItems[1].Text = os.path.basename(new_path)
             selected.ForeColor        = _CLR_READY
-
             still_missing = sum(
                 1 for i in range(self._lv.Items.Count)
                 if self._lv.Items[i].ForeColor == _CLR_MISSING)
-
             if still_missing == 0:
                 WinForms.MessageBox.Show(
-                    u"\u2714 All missing files have been relinked.\n\n"
+                    u"\u2714 All missing files relinked.\n\n"
                     "Click Close then Refresh to update the main list.",
                     "Relink Complete")
-
         except Exception as exc:
             _log("Health check relink error: " + str(exc))
             WinForms.MessageBox.Show("Relink failed:\n" + str(exc), "Error")
 
     def _find_record(self, label, old_path):
-        """Locate the manifest section and index for a missing file entry."""
         try:
             data = repo.load_manifest()
             for sec in repo.ALL_SECTIONS:
@@ -469,15 +487,548 @@ class HealthCheckDialog(WinForms.Form):
 
 
 # ────────────────────────────────────────────────────────────────────────────
-#  Project-info panel
+#  Archive Progress dialog
+# ────────────────────────────────────────────────────────────────────────────
+
+class ArchiveProgressDialog(WinForms.Form):
+    """
+    Modal progress dialog shown while RunWB2.exe runs in the background.
+    Polls every 500ms. Captures stdout/stderr for diagnostics.
+    Also used for regular file copy operations (no process, just label).
+    """
+
+    def __init__(self, label_text, process=None):
+        self._process  = process
+        self._success  = False
+        self._elapsed  = 0   # seconds
+
+        self.Text          = "Archiving..."
+        self.Width         = 520
+        self.Height        = 180
+        self.StartPosition = WinForms.FormStartPosition.CenterParent
+        self.MinimizeBox   = False
+        self.MaximizeBox   = False
+        self.ControlBox    = False
+        self.BackColor     = Drawing.Color.White
+        self.Font          = _FONT_NORMAL
+
+        lbl = WinForms.Label()
+        lbl.Text     = label_text
+        lbl.Location = Drawing.Point(16, 16)
+        lbl.Size     = Drawing.Size(480, 20)
+        lbl.Font     = _FONT_BOLD
+        self.Controls.Add(lbl)
+
+        self._lbl_status = WinForms.Label()
+        self._lbl_status.Text      = ("Opening project in batch mode..."
+                                       if process else "Copying file...")
+        self._lbl_status.ForeColor = Drawing.Color.FromArgb(80, 80, 80)
+        self._lbl_status.Location  = Drawing.Point(16, 44)
+        self._lbl_status.Size      = Drawing.Size(480, 20)
+        self.Controls.Add(self._lbl_status)
+
+        self._lbl_time = WinForms.Label()
+        self._lbl_time.Text      = ""
+        self._lbl_time.ForeColor = Drawing.Color.Gray
+        self._lbl_time.Font      = _FONT_SMALL
+        self._lbl_time.Location  = Drawing.Point(16, 64)
+        self._lbl_time.Size      = Drawing.Size(480, 16)
+        self.Controls.Add(self._lbl_time)
+
+        bar = WinForms.ProgressBar()
+        bar.Style    = WinForms.ProgressBarStyle.Marquee
+        bar.Location = Drawing.Point(16, 90)
+        bar.Size     = Drawing.Size(480, 22)
+        self.Controls.Add(bar)
+
+        self._lbl_hint = WinForms.Label()
+        self._lbl_hint.Text      = ("ANSYS Workbench is running in the background. "
+                                     "Do not close Workbench." if process else "")
+        self._lbl_hint.ForeColor = Drawing.Color.Gray
+        self._lbl_hint.Font      = _FONT_SMALL
+        self._lbl_hint.Location  = Drawing.Point(16, 122)
+        self._lbl_hint.Size      = Drawing.Size(480, 16)
+        self.Controls.Add(self._lbl_hint)
+
+        self._timer = WinForms.Timer()
+        self._timer.Interval = 500
+        self._timer.Tick    += self._on_tick
+        self._timer.Start()
+
+    def set_status(self, msg):
+        """Update status label — call this for non-process (copy) operations."""
+        self._lbl_status.Text = msg
+        WinForms.Application.DoEvents()
+
+    def finish_success(self):
+        """Call after a copy operation completes successfully."""
+        self._timer.Stop()
+        self._success = True
+        self._lbl_status.Text = u"\u2714 Done."
+        WinForms.Application.DoEvents()
+        System.Threading.Thread.Sleep(400)
+        self.DialogResult = WinForms.DialogResult.OK
+        self.Close()
+
+    def _on_tick(self, s, e):
+        try:
+            self._elapsed += 0.5
+            self._lbl_time.Text = "Elapsed: {0:.0f}s".format(self._elapsed)
+
+            if self._process is None:
+                # No process — dialog is being driven externally
+                return
+
+            if self._process.HasExited:
+                self._timer.Stop()
+                exit_code = self._process.ExitCode
+                self._success = (exit_code == 0)
+                _log("RunWB2 exited. Code={0}  Elapsed={1:.0f}s".format(
+                    exit_code, self._elapsed))
+                status_text = (u"\u2714 ANSYS ARCHIVE complete."
+                               if self._success
+                               else u"\u26A0 Completed (exit code {0}) — "
+                                    u"check log for details.".format(exit_code))
+                self._lbl_status.Text = status_text
+                WinForms.Application.DoEvents()
+                System.Threading.Thread.Sleep(800)
+                self.DialogResult = WinForms.DialogResult.OK
+                self.Close()
+            else:
+                msgs = [
+                    "Initializing ANSYS Workbench batch session...",
+                    "Opening project file...",
+                    "Running ANSYS ARCHIVE...",
+                    "Packaging project files...",
+                    "Writing .wbpz archive...",
+                    "Finalizing archive...",
+                ]
+                idx = int(self._elapsed / 15) % len(msgs)
+                self._lbl_status.Text = msgs[idx]
+        except Exception as exc:
+            self._timer.Stop()
+            _log("ArchiveProgressDialog tick error: " + str(exc))
+            self.Close()
+
+    @property
+    def succeeded(self):
+        return self._success
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  Archive dialog
+# ────────────────────────────────────────────────────────────────────────────
+
+class ArchiveDialog(WinForms.Form):
+    """
+    Checklist dialog for selecting files to archive.
+
+    Layout
+    ------
+    [Check All] [Uncheck All]
+    [ListView — one row per eligible file with checkboxes]
+    [.wbpj Options panel — shown only when .wbpj files are present]
+    [Archive Checked Files]  [Cancel]
+    """
+
+    # wbpj method constants
+    WBPJ_USE_WBPZ       = "wbpz"
+    WBPJ_COPY_WITH_FILES = "copy_with_files"
+    WBPJ_SKIP           = "skip"
+
+    def __init__(self, candidates, open_project_path=None):
+        self._candidates        = candidates   # list of dicts from repo helper
+        self._open_proj         = open_project_path
+        self._archived_results  = []           # filled after archive runs
+        self._has_wbpj          = any(c["is_wbpj"] for c in candidates)
+
+        self.Text          = u"Archive Repository Files"
+        self.Width         = 900
+        self.Height        = 640 if self._has_wbpj else 520
+        self.StartPosition = WinForms.FormStartPosition.CenterParent
+        self.MinimizeBox   = False
+        self.MaximizeBox   = True
+        self.BackColor     = Drawing.Color.White
+        self.Font          = _FONT_NORMAL
+
+        self._build_ui()
+        self._populate_list()
+
+    def _build_ui(self):
+        y = 12
+
+        # Header
+        lbl_hdr = WinForms.Label()
+        lbl_hdr.Text = (u"Select files to archive into the project repository. "
+                        u"Files already archived show their current status.")
+        lbl_hdr.Location = Drawing.Point(16, y)
+        lbl_hdr.Size     = Drawing.Size(850, 18)
+        lbl_hdr.Font     = _FONT_SMALL
+        lbl_hdr.ForeColor = Drawing.Color.Gray
+        self.Controls.Add(lbl_hdr)
+        y += 28
+
+        # Check All / Uncheck All
+        self.Controls.Add(_make_btn("Check All",   16, y, 100, 26,
+                                    handler=self._check_all))
+        self.Controls.Add(_make_btn("Uncheck All", 124, y, 110, 26,
+                                    handler=self._uncheck_all))
+        y += 36
+
+        # ListView
+        lv_height = 240
+        self._lv = WinForms.ListView()
+        self._lv.View          = WinForms.View.Details
+        self._lv.CheckBoxes     = True
+        self._lv.FullRowSelect  = True
+        self._lv.GridLines      = True
+        self._lv.Location       = Drawing.Point(16, y)
+        self._lv.Size           = Drawing.Size(854, lv_height)
+        self._lv.Font           = _FONT_NORMAL
+        self._lv.HeaderStyle    = WinForms.ColumnHeaderStyle.Nonclickable
+
+        for name, w in [("Section", 150), ("File Name", 220),
+                        ("Source Location", 240), ("Size", 80),
+                        ("Archive Status", 130)]:
+            self._lv.Columns.Add(name, w)
+
+        self.Controls.Add(self._lv)
+        y += lv_height + 10
+
+        # .wbpj options panel
+        if self._has_wbpj:
+            self._wbpj_panel = self._build_wbpj_panel(y)
+            self.Controls.Add(self._wbpj_panel)
+            y += self._wbpj_panel.Height + 10
+        else:
+            self._wbpj_panel = None
+
+        # Bottom buttons
+        btn_y = y + 4
+        self.Controls.Add(_make_btn(
+            u"\U0001F4E6  Archive Checked Files",
+            16, btn_y, 200, 36,
+            primary=True, handler=self._on_archive))
+        self.Controls.Add(_make_btn(
+            "Cancel", 230, btn_y, 100, 36,
+            handler=lambda s, e: self._cancel()))
+
+        # Resize form to fit
+        self.Height = btn_y + 80
+
+    def _build_wbpj_panel(self, top_y):
+        panel = WinForms.GroupBox()
+        panel.Text     = "Workbench Project (.wbpj) Archive Method"
+        panel.Location = Drawing.Point(16, top_y)
+        panel.Size     = Drawing.Size(854, 120)
+        panel.Font     = _FONT_NORMAL
+
+        self._rb_wbpz = WinForms.RadioButton()
+        self._rb_wbpz.Text     = (u"ANSYS ARCHIVE \u2192 produce self-contained "
+                                   u".wbpz  (recommended)")
+        self._rb_wbpz.Location = Drawing.Point(12, 22)
+        self._rb_wbpz.Size     = Drawing.Size(500, 20)
+        self._rb_wbpz.Checked  = True
+        panel.Controls.Add(self._rb_wbpz)
+
+        self._chk_results = WinForms.CheckBox()
+        self._chk_results.Text     = "Include result files"
+        self._chk_results.Location = Drawing.Point(40, 46)
+        self._chk_results.Size     = Drawing.Size(160, 20)
+        self._chk_results.Checked  = False
+        panel.Controls.Add(self._chk_results)
+
+        self._chk_external = WinForms.CheckBox()
+        self._chk_external.Text     = "Include external files"
+        self._chk_external.Location = Drawing.Point(210, 46)
+        self._chk_external.Size     = Drawing.Size(160, 20)
+        self._chk_external.Checked  = True
+        panel.Controls.Add(self._chk_external)
+
+        self._rb_copy = WinForms.RadioButton()
+        self._rb_copy.Text     = ("Copy .wbpj + _files folder  "
+                                   "(preserves references, may be large)")
+        self._rb_copy.Location = Drawing.Point(12, 72)
+        self._rb_copy.Size     = Drawing.Size(500, 20)
+        panel.Controls.Add(self._rb_copy)
+
+        self._rb_skip = WinForms.RadioButton()
+        self._rb_skip.Text     = "Skip .wbpj files (leave as references only)"
+        self._rb_skip.Location = Drawing.Point(12, 96)
+        self._rb_skip.Size     = Drawing.Size(500, 20)
+        panel.Controls.Add(self._rb_skip)
+
+        return panel
+
+    def _populate_list(self):
+        self._lv.Items.Clear()
+        for c in self._candidates:
+            item = WinForms.ListViewItem(c["section_label"])
+
+            # Colour the row for context
+            status = c["archive_status"]
+            if status == repo.ARCH_STATUS_MISSING:
+                item.ForeColor = _CLR_MISSING
+            elif status == repo.ARCH_STATUS_OK:
+                item.ForeColor = _CLR_ARCHIVED_OK
+            elif status == repo.ARCH_STATUS_OUTDATED:
+                item.ForeColor = _CLR_ARCHIVED_OLD
+
+            item.SubItems.Add(c["label"])
+            item.SubItems.Add(c["source_path"])
+
+            # Size — for .wbpj show total (wbpj + _files), for others show file size
+            if c["is_wbpj"]:
+                size_str  = c["wbpj_total_size_str"]
+                size_bytes = c["wbpj_total_size_bytes"]
+            else:
+                size_str  = c["source_size_str"]
+                size_bytes = c["source_size_bytes"]
+
+            # Warn if > 1 GB
+            if size_bytes > SIZE_WARN_BYTES:
+                size_str += u"  \u26A0"   # warning triangle
+
+            item.SubItems.Add(size_str)
+            item.SubItems.Add(status)
+
+            # Default: check files not yet archived or out of date
+            item.Checked = (status != repo.ARCH_STATUS_OK)
+
+            self._lv.Items.Add(item)
+
+    def _check_all(self, s, e):
+        for i in range(self._lv.Items.Count):
+            self._lv.Items[i].Checked = True
+
+    def _uncheck_all(self, s, e):
+        for i in range(self._lv.Items.Count):
+            self._lv.Items[i].Checked = False
+
+    def _get_wbpj_method(self):
+        if self._wbpj_panel is None:
+            return self.WBPJ_SKIP
+        if self._rb_wbpz.Checked:
+            return self.WBPJ_USE_WBPZ
+        if self._rb_copy.Checked:
+            return self.WBPJ_COPY_WITH_FILES
+        return self.WBPJ_SKIP
+
+    def _cancel(self):
+        self.DialogResult = WinForms.DialogResult.Cancel
+        self.Close()
+
+    def _on_archive(self, s, e):
+        """Run the archive operation for all checked items."""
+        checked = [self._candidates[i]
+                   for i in range(self._lv.Items.Count)
+                   if self._lv.Items[i].Checked]
+
+        if not checked:
+            WinForms.MessageBox.Show(
+                "No files are checked. Select at least one file to archive.",
+                "Nothing Selected")
+            return
+
+        wbpj_method = self._get_wbpj_method()
+
+        # Warn about large files before starting
+        large = [c for c in checked
+                 if (c["wbpj_total_size_bytes"] if c["is_wbpj"]
+                     else c["source_size_bytes"]) > SIZE_WARN_BYTES]
+        if large:
+            names = "\n".join(u"  \u2022 " + c["label"] for c in large)
+            res = WinForms.MessageBox.Show(
+                u"The following files are larger than 1 GB:\n\n{0}\n\n"
+                u"This may take several minutes. Continue?".format(names),
+                u"Large File Warning",
+                WinForms.MessageBoxButtons.YesNo,
+                WinForms.MessageBoxIcon.Warning)
+            if res != WinForms.DialogResult.Yes:
+                return
+
+        runwb2 = _get_runwb2_path() if wbpj_method == self.WBPJ_USE_WBPZ else None
+        if wbpj_method == self.WBPJ_USE_WBPZ and not runwb2:
+            WinForms.MessageBox.Show(
+                "RunWB2.exe could not be located.\n"
+                "Please use 'Copy .wbpj + _files folder' instead,\n"
+                "or verify your ANSYS installation.",
+                "RunWB2 Not Found",
+                WinForms.MessageBoxButtons.OK,
+                WinForms.MessageBoxIcon.Warning)
+            return
+
+        successes = []
+        failures  = []
+
+        for c in checked:
+            section  = c["section"]
+            index    = c["index"]
+            src      = c["source_path"]
+            dest_dir = repo.get_section_archive_dir(section)
+            label    = c["label"]
+
+            try:
+                if c["is_wbpj"]:
+                    if wbpj_method == self.WBPJ_USE_WBPZ:
+                        dest_path = self._archive_via_wbpz(
+                            src, dest_dir, runwb2,
+                            self._chk_results.Checked,
+                            self._chk_external.Checked,
+                            label)
+                        method = "wbpz"
+                    elif wbpj_method == self.WBPJ_COPY_WITH_FILES:
+                        # Show progress for potentially large folder copy
+                        prog = ArchiveProgressDialog(
+                            u"Copying: {0}".format(label))
+                        prog.Show()
+                        prog.set_status(u"Copying .wbpj + _files folder...")
+                        WinForms.Application.DoEvents()
+                        dest_path = repo.copy_wbpj_with_files(src, dest_dir)
+                        prog.finish_success()
+                        method    = "copy_with_files"
+                    else:
+                        # Skip
+                        continue
+                else:
+                    # Show progress for regular file copy
+                    size_mb = c.get("source_size_bytes", 0) / (1024.0 * 1024)
+                    prog = ArchiveProgressDialog(
+                        u"Copying: {0}  ({1:.1f} MB)".format(label, size_mb))
+                    prog.Show()
+                    prog.set_status(u"Copying file to archive folder...")
+                    WinForms.Application.DoEvents()
+                    dest_path = repo.archive_regular_file(src, dest_dir)
+                    prog.finish_success()
+                    method    = "copy"
+
+                repo.update_archive_record(section, index, dest_path, method)
+                successes.append(label)
+                _log("Archived: " + label + " -> " + dest_path)
+
+            except Exception as exc:
+                failures.append("{0}: {1}".format(label, str(exc)))
+                _log("Archive failed [{0}]: {1}".format(label, str(exc)))
+
+        # Summary
+        msg_parts = []
+        if successes:
+            msg_parts.append(
+                u"\u2714 Archived successfully ({0}):\n{1}".format(
+                    len(successes),
+                    "\n".join(u"  \u2022 " + s for s in successes)))
+        if failures:
+            msg_parts.append(
+                u"\u2718 Failed ({0}):\n{1}".format(
+                    len(failures),
+                    "\n".join(u"  \u2022 " + f for f in failures)))
+
+        WinForms.MessageBox.Show(
+            "\n\n".join(msg_parts) if msg_parts else "No files were processed.",
+            "Archive Complete" if not failures else "Archive — Partial Success",
+            WinForms.MessageBoxButtons.OK,
+            WinForms.MessageBoxIcon.Information if not failures
+            else WinForms.MessageBoxIcon.Warning)
+
+        self._archived_results = successes
+        self.DialogResult = WinForms.DialogResult.OK
+        self.Close()
+
+    def _archive_via_wbpz(self, wbpj_path, dest_dir, runwb2,
+                           include_results, include_external, label):
+        """
+        Generate a batch script and run RunWB2.exe -B -R to produce a .wbpz.
+        Shows a progress dialog while the subprocess runs.
+        Captures stdout/stderr and writes to log for diagnostics.
+        Returns the path of the produced .wbpz file.
+        """
+        script_path, expected_wbpz, marker_path = repo.generate_wbpz_script(
+            wbpj_path, dest_dir,
+            include_results=include_results,
+            include_external=include_external,
+            archive_notes="Archived via AnalysisHub")
+
+        _log("Launching RunWB2 batch for: " + wbpj_path)
+        _log("Script:          " + script_path)
+        _log("Expected .wbpz:  " + expected_wbpz)
+        _log("Completion marker: " + marker_path)
+        _log("RunWB2:          " + runwb2)
+
+        info = System.Diagnostics.ProcessStartInfo()
+        info.FileName               = runwb2
+        info.Arguments              = u'-B -R "{0}"'.format(script_path)
+        info.UseShellExecute        = False
+        info.CreateNoWindow         = True
+        info.RedirectStandardOutput = True
+        info.RedirectStandardError  = True
+
+        proc = System.Diagnostics.Process.Start(info)
+
+        # Show progress dialog — blocks UI until process exits
+        prog = ArchiveProgressDialog(
+            u"ANSYS ARCHIVE: {0}".format(label), proc)
+        prog.ShowDialog()
+
+        # Capture and log process output for diagnostics
+        try:
+            stdout = proc.StandardOutput.ReadToEnd()
+            stderr = proc.StandardError.ReadToEnd()
+            if stdout.strip():
+                _log("RunWB2 stdout:\n" + stdout.strip()[:1000])
+            if stderr.strip():
+                _log("RunWB2 stderr:\n" + stderr.strip()[:1000])
+        except Exception as exc:
+            _log("Could not read RunWB2 output: " + str(exc))
+
+        exit_code = proc.ExitCode
+        _log("RunWB2 exit code: " + str(exit_code))
+
+        # Check completion marker — tells us if the script ran to end
+        script_ran_to_end = os.path.exists(marker_path)
+        _log("Script ran to completion: " + str(script_ran_to_end))
+
+        repo.cleanup_archive_script(script_path)
+
+        # List dest_dir contents for diagnostics
+        try:
+            contents = os.listdir(dest_dir) if os.path.isdir(dest_dir) else []
+            _log("dest_dir contents: " + str(contents))
+        except Exception:
+            pass
+
+        # Verify output exists
+        if not os.path.exists(expected_wbpz):
+            if not script_ran_to_end:
+                reason = ("The ARCHIVE script did not run to completion.\n"
+                          "RunWB2 likely failed to start, could not open the "
+                          "project, or crashed before archiving.")
+            else:
+                reason = ("The script ran but the Archive() command did not "
+                          "produce the expected .wbpz output.\n"
+                          "The project may have unsaved changes or locked files.")
+            raise IOError(
+                u"ANSYS ARCHIVE did not produce the expected file.\n\n"
+                u"Expected:\n  {0}\n\n"
+                u"{1}\n\n"
+                u"Check C:\\Temp\\AnalysisHub_debug.log for full details.\n"
+                u"As a fallback, use \'Copy .wbpj + _files folder\' instead.".format(
+                    expected_wbpz, reason))
+
+        _log("wbpz verified at: " + expected_wbpz)
+        return expected_wbpz
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  Project-info panel  (with Status change handler)
 # ────────────────────────────────────────────────────────────────────────────
 
 class ProjectInfoPanel(WinForms.Panel):
     def __init__(self, form_ref):
-        self._form     = form_ref
-        self._expanded = True
-        self.BackColor   = Drawing.Color.FromArgb(245, 248, 252)
-        self.BorderStyle = WinForms.BorderStyle.FixedSingle
+        self._form          = form_ref
+        self._expanded      = True
+        self._suppress_evt  = False   # prevents recursive status-change events
+        self.BackColor      = Drawing.Color.FromArgb(245, 248, 252)
+        self.BorderStyle    = WinForms.BorderStyle.FixedSingle
         self._build_ui()
         self._load_values()
 
@@ -500,8 +1051,8 @@ class ProjectInfoPanel(WinForms.Panel):
         self._btn_toggle     = btn_toggle
         self.Controls.Add(btn_toggle)
 
-        self.Controls.Add(_make_btn("Save Info", 300, 4, 90, 22, primary=True,
-                                    handler=self._save))
+        self.Controls.Add(_make_btn("Save Info", 300, 4, 90, 22,
+                                    primary=True, handler=self._save))
 
         self._fields_panel = WinForms.Panel()
         self._fields_panel.Location = Drawing.Point(0, 32)
@@ -515,7 +1066,6 @@ class ProjectInfoPanel(WinForms.Panel):
             lbl2.Location = Drawing.Point(x0 + col * 200, 6)
             lbl2.Size     = Drawing.Size(70, 20)
             self._fields_panel.Controls.Add(lbl2)
-
             tb = WinForms.TextBox()
             tb.Location = Drawing.Point(x0 + col * 200 + 72, 4)
             tb.Size     = Drawing.Size(118, 24)
@@ -535,6 +1085,7 @@ class ProjectInfoPanel(WinForms.Panel):
         self._cb_status.Size     = Drawing.Size(130, 24)
         for s in ["Active", "In Review", "Complete", "On Hold", "Archived"]:
             self._cb_status.Items.Add(s)
+        self._cb_status.SelectedIndexChanged += self._on_status_changed
         self._fields_panel.Controls.Add(self._cb_status)
 
         lbl_r = WinForms.Label()
@@ -558,6 +1109,7 @@ class ProjectInfoPanel(WinForms.Panel):
 
     def _load_values(self):
         try:
+            self._suppress_evt = True
             info = repo.get_project_info()
             self._tb_title.Text    = info.get("title",    "")
             self._tb_customer.Text = info.get("customer", "")
@@ -572,6 +1124,8 @@ class ProjectInfoPanel(WinForms.Panel):
                 self._cb_status.SelectedIndex = 0
         except Exception as exc:
             _log("ProjectInfoPanel load error: " + str(exc))
+        finally:
+            self._suppress_evt = False
 
     def _save(self, s, e):
         try:
@@ -584,8 +1138,40 @@ class ProjectInfoPanel(WinForms.Panel):
             })
             _log("Project info saved")
         except Exception as exc:
-            _log("ProjectInfoPanel save error: " + str(exc))
+            _log("Save error: " + str(exc))
             WinForms.MessageBox.Show("Save failed:\n" + str(exc), "Error")
+
+    def _on_status_changed(self, s, e):
+        """
+        Fires when the user changes the Status dropdown.
+        If they select 'Archived', prompt to run the archive workflow.
+        """
+        if self._suppress_evt:
+            return
+        try:
+            selected = str(self._cb_status.SelectedItem or "")
+            if selected != "Archived":
+                return   # other statuses — no action yet, reserved for future
+
+            # Save the status first
+            self._save(None, None)
+
+            # Ask if they want to archive files now
+            res = WinForms.MessageBox.Show(
+                u"You have set this project to \u2018Archived\u2019 status.\n\n"
+                u"Would you like to copy reference files into the project "
+                u"repository archive folders now?\n\n"
+                u"You can also run this later using the "
+                u"\U0001F4E6 Archive Files toolbar button.",
+                u"Archive Repository Files?",
+                WinForms.MessageBoxButtons.YesNo,
+                WinForms.MessageBoxIcon.Question)
+
+            if res == WinForms.DialogResult.Yes:
+                self._form.launch_archive_dialog()
+
+        except Exception as exc:
+            _log("Status change handler error: " + str(exc))
 
     def _log_revision(self, s, e):
         try:
@@ -660,19 +1246,35 @@ class RepositoryForm(WinForms.Form):
 
         toolbar_y = 62
         toolbar_h = 42
+        x = 16
 
-        self.Controls.Add(_make_btn(u"\u2795  Add File(s)...", 16,  toolbar_y, 160,
-                                    toolbar_h, primary=True, handler=self._on_add))
-        self.Controls.Add(_make_btn(u"\u21BA  Refresh",        186, toolbar_y, 110,
-                                    toolbar_h, handler=self._refresh_all))
-        self.Controls.Add(_make_btn(u"\u25B6  Open",           306, toolbar_y, 100,
-                                    toolbar_h, handler=self._on_open))
-        self.Controls.Add(_make_btn(u"\u2716  Remove",         416, toolbar_y, 110,
-                                    toolbar_h, handler=self._on_remove))
-        self.Controls.Add(_make_btn(u"\u270E  Notes",          536, toolbar_y, 100,
-                                    toolbar_h, handler=self._on_notes))
-        self.Controls.Add(_make_btn(u"\u2764  Health Check",   646, toolbar_y, 140,
-                                    toolbar_h, handler=self._on_health_check))
+        self.Controls.Add(_make_btn(u"\u2795  Add File(s)...", x, toolbar_y,
+                                    160, toolbar_h, primary=True,
+                                    handler=self._on_add))
+        x += 168
+        self.Controls.Add(_make_btn(u"\u21BA  Refresh", x, toolbar_y,
+                                    110, toolbar_h,
+                                    handler=self._refresh_all))
+        x += 118
+        self.Controls.Add(_make_btn(u"\u25B6  Open", x, toolbar_y,
+                                    100, toolbar_h,
+                                    handler=self._on_open))
+        x += 108
+        self.Controls.Add(_make_btn(u"\u2716  Remove", x, toolbar_y,
+                                    110, toolbar_h,
+                                    handler=self._on_remove))
+        x += 118
+        self.Controls.Add(_make_btn(u"\u270E  Notes", x, toolbar_y,
+                                    100, toolbar_h,
+                                    handler=self._on_notes))
+        x += 108
+        self.Controls.Add(_make_btn(u"\u2764  Health Check", x, toolbar_y,
+                                    140, toolbar_h,
+                                    handler=self._on_health_check))
+        x += 148
+        self.Controls.Add(_make_btn(u"\U0001F4E6  Archive Files", x, toolbar_y,
+                                    150, toolbar_h,
+                                    handler=self._on_archive))
 
         sep = WinForms.Label()
         sep.BorderStyle = WinForms.BorderStyle.Fixed3D
@@ -700,7 +1302,6 @@ class RepositoryForm(WinForms.Form):
         self._tabs.SelectedIndexChanged += self._on_tab_changed
 
         self._listviews = {}
-
         for sec in repo.ALL_SECTIONS:
             tab = WinForms.TabPage()
             tab.Text      = repo.SECTION_LABELS[sec]
@@ -756,12 +1357,12 @@ class RepositoryForm(WinForms.Form):
     def _on_draw_tab(self, s, e):
         try:
             is_active = (e.Index == self._tabs.SelectedIndex)
-            bg   = _CLR_ANSYS_BLUE if is_active else Drawing.Color.FromArgb(240, 240, 240)
-            fg   = Drawing.Color.White if is_active else Drawing.Color.FromArgb(100, 100, 100)
+            bg   = _CLR_ANSYS_BLUE if is_active else Drawing.Color.FromArgb(
+                240, 240, 240)
+            fg   = Drawing.Color.White if is_active else Drawing.Color.FromArgb(
+                100, 100, 100)
             font = _FONT_BOLD if is_active else _FONT_NORMAL
-
             e.Graphics.FillRectangle(Drawing.SolidBrush(bg), e.Bounds)
-
             fmt = Drawing.StringFormat()
             fmt.Alignment     = Drawing.StringAlignment.Center
             fmt.LineAlignment = Drawing.StringAlignment.Center
@@ -769,8 +1370,7 @@ class RepositoryForm(WinForms.Form):
                 self._tabs.TabPages[e.Index].Text, font,
                 Drawing.SolidBrush(fg),
                 Drawing.RectangleF(e.Bounds.X, e.Bounds.Y,
-                                   e.Bounds.Width, e.Bounds.Height),
-                fmt)
+                                   e.Bounds.Width, e.Bounds.Height), fmt)
         except Exception as exc:
             _log("Tab draw error: " + str(exc))
 
@@ -842,9 +1442,9 @@ class RepositoryForm(WinForms.Form):
                     return 0.0
             return val.lower()
 
-        sorted_records = sorted(records, key=sort_key, reverse=not asc)
-        self._section_data[section] = sorted_records
-        self._populate_listview(section, sorted_records)
+        self._section_data[section] = sorted(
+            records, key=sort_key, reverse=not asc)
+        self._populate_listview(section, self._section_data[section])
 
     # ── Data / population ─────────────────────────────────────────────────
 
@@ -857,7 +1457,8 @@ class RepositoryForm(WinForms.Form):
                 self._sort_listview(sec)
             total, missing = repo.get_summary_stats()
             self._set_status(
-                u"Loaded \u2014 {0} file(s), {1} missing".format(total, missing))
+                u"Loaded \u2014 {0} file(s), {1} missing".format(
+                    total, missing))
             self._update_tab_labels()
         except Exception as exc:
             _log("Refresh error: " + traceback.format_exc())
@@ -884,9 +1485,15 @@ class RepositoryForm(WinForms.Form):
             path = r.get("source_path", "")
             item.SubItems.Add(path)
 
-            if status == "MISSING":
+            if status == repo.ARCH_STATUS_MISSING:
                 item.ForeColor = _CLR_MISSING
                 item.Font      = _FONT_BOLD
+            elif status == repo.ARCH_STATUS_OK:
+                item.ForeColor = _CLR_ARCHIVED_OK
+                item.Font      = _FONT_NORMAL
+            elif status == repo.ARCH_STATUS_OUTDATED:
+                item.ForeColor = _CLR_ARCHIVED_OLD
+                item.Font      = _FONT_BOLD   # bold + orange = visual double indicator
             else:
                 item.ForeColor = Drawing.Color.Black
                 item.Font      = _FONT_NORMAL
@@ -898,13 +1505,15 @@ class RepositoryForm(WinForms.Form):
         for i, sec in enumerate(repo.ALL_SECTIONS):
             records = self._section_data.get(sec, [])
             total   = len(records)
-            missing = sum(1 for r in records if r.get("status") == "MISSING")
+            missing = sum(1 for r in records
+                          if r.get("status") == repo.ARCH_STATUS_MISSING)
             base    = repo.SECTION_LABELS[sec]
             if missing > 0:
-                self._tabs.TabPages[i].Text = u"{0}  [{1}  \u2718{2}]".format(
-                    base, total, missing)
+                self._tabs.TabPages[i].Text = (
+                    u"{0}  [{1}  \u2718{2}]".format(base, total, missing))
             else:
-                self._tabs.TabPages[i].Text = u"{0}  [{1}]".format(base, total)
+                self._tabs.TabPages[i].Text = (
+                    u"{0}  [{1}]".format(base, total))
 
     def _set_status(self, msg):
         self._status_lbl.Text = msg
@@ -943,7 +1552,9 @@ class RepositoryForm(WinForms.Form):
             if idx < 0 or idx >= len(records):
                 return
             record  = records[idx]
-            missing = record.get("status") == "MISSING"
+            status  = record.get("status", "")
+            missing = (status == repo.ARCH_STATUS_MISSING)
+            outdated= (status == repo.ARCH_STATUS_OUTDATED)
 
             menu = WinForms.ContextMenuStrip()
 
@@ -962,6 +1573,12 @@ class RepositoryForm(WinForms.Form):
             _sec = sec
             item_relink.Click += lambda s2, e2: self._on_relink(_sec, _idx)
 
+            item_rearchive = menu.Items.Add(
+                u"\u27F3  Re-archive (update copy)")
+            item_rearchive.Enabled = outdated
+            item_rearchive.Click  += lambda s2, e2: self._on_rearchive(
+                _sec, _idx)
+
             menu.Items.Add(WinForms.ToolStripSeparator())
 
             item_remove = menu.Items.Add(u"\u2716  Remove from Repository")
@@ -971,7 +1588,120 @@ class RepositoryForm(WinForms.Form):
         except Exception as exc:
             _log("Context menu error: " + str(exc))
 
-    # ── Relink (main list) ────────────────────────────────────────────────
+    # ── Archive launcher (public — called by ProjectInfoPanel) ────────────
+
+    def launch_archive_dialog(self):
+        """Open the archive dialog. Called from status dropdown or toolbar."""
+        try:
+            open_proj  = _get_open_project_path()
+            candidates = repo.get_archive_candidates(open_proj)
+
+            if not candidates:
+                WinForms.MessageBox.Show(
+                    "No eligible files found to archive.\n\n"
+                    "Add files to the repository first.\n\n"
+                    "Note: the currently open project is automatically "
+                    "excluded from archiving.",
+                    "Nothing to Archive")
+                return
+
+            dlg = ArchiveDialog(candidates, open_proj)
+            if dlg.ShowDialog() == WinForms.DialogResult.OK:
+                self._refresh_all(None, None)
+                archived = dlg._archived_results
+                if archived:
+                    self._set_status(
+                        u"Archived {0} file(s): {1}".format(
+                            len(archived),
+                            ", ".join(archived[:3]) +
+                            ("..." if len(archived) > 3 else "")))
+        except Exception as exc:
+            _log("launch_archive_dialog error: " + traceback.format_exc())
+            WinForms.MessageBox.Show(
+                "Archive dialog error:\n" + str(exc), "Error")
+
+    # ── Re-archive single file ────────────────────────────────────────────
+
+    def _on_rearchive(self, section, index):
+        """Re-archive a single outdated file from the right-click menu."""
+        try:
+            records = self._section_data.get(section, [])
+            if index < 0 or index >= len(records):
+                return
+            record = records[index]
+            src    = record.get("source_path", "")
+            label  = record.get("label", "")
+
+            open_proj = _get_open_project_path()
+            if (open_proj and os.path.normcase(os.path.abspath(src)) ==
+                    os.path.normcase(os.path.abspath(open_proj))):
+                WinForms.MessageBox.Show(
+                    "Cannot archive the currently open project.",
+                    "Not Allowed")
+                return
+
+            dest_dir = repo.get_section_archive_dir(section)
+            ext      = os.path.splitext(src)[1].lower()
+
+            if ext == ".wbpj":
+                runwb2 = _get_runwb2_path()
+                if runwb2:
+                    res = WinForms.MessageBox.Show(
+                        u"Re-archive '{0}' using ANSYS ARCHIVE (.wbpz)?".format(
+                            label),
+                        "Confirm Re-archive",
+                        WinForms.MessageBoxButtons.YesNo)
+                    if res != WinForms.DialogResult.Yes:
+                        return
+                    dlg = ArchiveDialog([repo.get_archive_candidates(
+                        open_proj)[0]], open_proj)
+                    script_path, expected_wbpz, marker_path = (
+                        repo.generate_wbpz_script(src, dest_dir))
+                    info = System.Diagnostics.ProcessStartInfo()
+                    info.FileName               = runwb2
+                    info.Arguments              = u'-B -R "{0}"'.format(
+                        script_path)
+                    info.UseShellExecute        = False
+                    info.CreateNoWindow         = True
+                    info.RedirectStandardOutput = True
+                    info.RedirectStandardError  = True
+                    proc = System.Diagnostics.Process.Start(info)
+                    prog = ArchiveProgressDialog(
+                        u"Re-archiving: {0}".format(label), proc)
+                    prog.ShowDialog()
+                    try:
+                        stdout = proc.StandardOutput.ReadToEnd()
+                        if stdout.strip():
+                            _log("Re-archive RunWB2 output: " +
+                                 stdout.strip()[:500])
+                    except Exception:
+                        pass
+                    repo.cleanup_archive_script(script_path)
+                    if os.path.exists(expected_wbpz):
+                        repo.update_archive_record(section, index,
+                                                   expected_wbpz, "wbpz")
+                    else:
+                        _log("Re-archive: .wbpz not found at " + expected_wbpz)
+                        WinForms.MessageBox.Show(
+                            "Re-archive did not produce the expected .wbpz.\n"
+                            "Check the debug log for details.",
+                            "Re-archive Warning")
+                else:
+                    dest_path = repo.copy_wbpj_with_files(src, dest_dir)
+                    repo.update_archive_record(section, index,
+                                               dest_path, "copy_with_files")
+            else:
+                dest_path = repo.archive_regular_file(src, dest_dir)
+                repo.update_archive_record(section, index, dest_path, "copy")
+
+            self._refresh_all(None, None)
+            self._set_status(u"Re-archived: {0}".format(label))
+
+        except Exception as exc:
+            _log("Re-archive error: " + str(exc))
+            WinForms.MessageBox.Show("Re-archive failed:\n" + str(exc), "Error")
+
+    # ── Relink ────────────────────────────────────────────────────────────
 
     def _on_relink(self, section, index):
         try:
@@ -986,16 +1716,14 @@ class RepositoryForm(WinForms.Form):
             dlg.Title    = u"Relink: locate \"{0}\"".format(old_name)
             dlg.Filter   = "All Files (*.*)|*.*"
             dlg.FileName = old_name
-
             if dlg.ShowDialog() != WinForms.DialogResult.OK:
                 return
 
             new_path = dlg.FileName
-            _log("Relinking [{0}] index {1}: {2} -> {3}".format(
-                section, index, old_path, new_path))
             repo.relink_file_record(section, index, new_path)
             self._refresh_all(None, None)
-            self._set_status(u"Relinked: {0}".format(os.path.basename(new_path)))
+            self._set_status(
+                u"Relinked: {0}".format(os.path.basename(new_path)))
         except Exception as exc:
             _log("Relink error: " + str(exc))
             WinForms.MessageBox.Show("Relink failed:\n" + str(exc), "Error")
@@ -1004,7 +1732,6 @@ class RepositoryForm(WinForms.Form):
 
     def _on_add(self, sender, e):
         try:
-            _log("Add File clicked for section: " + self._cur_section)
             dlg = WinForms.OpenFileDialog()
             dlg.Multiselect = True
             dlg.Title       = "Add File(s) to {0}".format(
@@ -1038,7 +1765,8 @@ class RepositoryForm(WinForms.Form):
             _, record = sel[0]
             path = record.get("source_path", "")
             if not _smart_open_file(path):
-                WinForms.MessageBox.Show("Failed to open:\n" + path, "Open Error")
+                WinForms.MessageBox.Show(
+                    "Failed to open:\n" + path, "Open Error")
         except Exception as exc:
             _log("Open error: " + str(exc))
 
@@ -1055,7 +1783,8 @@ class RepositoryForm(WinForms.Form):
                     "Remove {0} file(s) from the repository?\n\n{1}".format(
                         len(sel), names),
                     "Confirm Remove",
-                    WinForms.MessageBoxButtons.YesNo) != WinForms.DialogResult.Yes:
+                    WinForms.MessageBoxButtons.YesNo
+                    ) != WinForms.DialogResult.Yes:
                 return
             for idx, _ in sorted(sel, key=lambda t: t[0], reverse=True):
                 repo.remove_file_record(self._cur_section, idx)
@@ -1073,7 +1802,8 @@ class RepositoryForm(WinForms.Form):
             idx, record = sel[0]
             dlg = NotesDialog(record.get("notes", ""))
             if dlg.ShowDialog() == WinForms.DialogResult.OK:
-                repo.update_file_notes(self._cur_section, idx, dlg.result_notes)
+                repo.update_file_notes(self._cur_section, idx,
+                                       dlg.result_notes)
                 self._refresh_all(None, None)
         except Exception as exc:
             _log("Notes error: " + str(exc))
@@ -1083,12 +1813,15 @@ class RepositoryForm(WinForms.Form):
             self._set_status("Running health check...")
             health = repo.run_health_check()
             HealthCheckDialog(health).ShowDialog()
-            # Refresh main list in case user relinked files in the dialog
             self._refresh_all(None, None)
             self._set_status("Health check complete.")
         except Exception as exc:
             _log("Health check error: " + str(exc))
-            WinForms.MessageBox.Show("Health check failed:\n" + str(exc), "Error")
+            WinForms.MessageBox.Show(
+                "Health check failed:\n" + str(exc), "Error")
+
+    def _on_archive(self, sender, e):
+        self.launch_archive_dialog()
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -1105,10 +1838,7 @@ def _launch_repository_form(task=None):
                 "No saved Workbench project was found.\n\n"
                 "Please save your project first:\n"
                 u"    File  \u2192  Save As\u2026\n\n"
-                "Then click the Analysis Repository button again.\n\n"
-                "Each project must be saved before its repository can be "
-                "created, so that the manifest is stored alongside the "
-                "project files.",
+                "Then click the Analysis Repository button again.",
                 u"Analysis Hub \u2014 Save Project First",
                 WinForms.MessageBoxButtons.OK,
                 WinForms.MessageBoxIcon.Information)
@@ -1199,7 +1929,8 @@ def task_status(task):
         repo.set_base_directory(user_files_dir)
         total, missing = repo.get_summary_stats()
         if total == 0:
-            return ["Unfulfilled", "Repository is empty - add files to get started"]
+            return ["Unfulfilled",
+                    "Repository is empty - add files to get started"]
         elif missing > 0:
             return ["Refresh Required",
                     "{0} file(s) missing from repository".format(missing)]
