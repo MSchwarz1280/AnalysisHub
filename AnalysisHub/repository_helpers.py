@@ -245,38 +245,7 @@ def _migrate_manifest_v1_to_v2(old):
 #  Archive status helpers
 # ────────────────────────────────────────────────────────────────────────────
 
-def get_archive_status(record):
-    """
-    Return the archive status string for a record.
-    Checks whether source file exists, whether an archive copy exists,
-    and whether the source has changed since archiving.
-
-    Returns one of:
-        ARCH_STATUS_MISSING   — source file not found
-        ARCH_STATUS_NONE      — no archive copy (Ready)
-        ARCH_STATUS_OK        — archived and up to date
-        ARCH_STATUS_OUTDATED  — archived but source has changed
-    """
-    src_path = record.get("source_path", "")
-
-    if not src_path or not os.path.exists(src_path):
-        return ARCH_STATUS_MISSING
-
-    archive_path = record.get("archive_path", "")
-    if not archive_path or not os.path.exists(archive_path):
-        return ARCH_STATUS_NONE
-
-    # Compare source modification time against recorded archive timestamp
-    try:
-        current_mtime = os.path.getmtime(src_path)
-        archived_mtime = record.get("archive_src_mtime", 0)
-        # Allow 2-second tolerance for filesystem timestamp rounding
-        if abs(current_mtime - archived_mtime) > 2:
-            return ARCH_STATUS_OUTDATED
-    except Exception:
-        return ARCH_STATUS_OUTDATED
-
-    return ARCH_STATUS_OK
+# get_archive_status — see updated version below
 
 
 def get_folder_size(folder_path):
@@ -404,17 +373,16 @@ def generate_wbpz_script(wbpj_path, dest_dir,
     if not os.path.exists(dest_dir):
         os.makedirs(dest_dir)
 
+    import re
     project_name = os.path.splitext(os.path.basename(wbpj_path))[0]
-    wbpz_path    = os.path.join(dest_dir, project_name + ".wbpz")
 
-    # Write script to temp location alongside the manifest
-    script_path  = os.path.join(get_repo_root(),
-                                "_archive_temp_{0}.py".format(project_name))
-
-    # Completion marker — written at the very end of the script.
-    # main.py checks for this file to distinguish "script ran but failed"
-    # from "RunWB2 crashed before the script ran at all".
-    marker_path = script_path.replace(".py", ".done")
+    # Script and marker go to C:\Temp with a space-free sanitised name.
+    # RunWB2 exits with code 2 when the -R script path contains spaces,
+    # even when the path is quoted — so we always use this safe location.
+    safe_name   = re.sub(r"[^A-Za-z0-9_]", "_", project_name)
+    script_path = r"C:\Temp\AnalysisHub_archive_{0}.py".format(safe_name)
+    marker_path = r"C:\Temp\AnalysisHub_archive_{0}.done".format(safe_name)
+    wbpz_path   = os.path.join(dest_dir, project_name + ".wbpz")
 
     script_lines = [
         "# AnalysisHub --- auto-generated ARCHIVE script",
@@ -472,37 +440,7 @@ def cleanup_archive_script(script_path):
             _safe_log("Could not remove temp file: " + str(exc))
 
 
-def update_archive_record(section, index, archive_path, method):
-    """
-    Write archive metadata into the manifest record at [section][index].
-
-    method: "wbpz" | "copy_with_files" | "copy"
-    """
-    data    = load_manifest()
-    records = data["sections"].get(section, [])
-    if index < 0 or index >= len(records):
-        _safe_log("update_archive_record: index out of range")
-        return False
-
-    src_path = records[index].get("source_path", "")
-    try:
-        src_mtime = os.path.getmtime(src_path) if os.path.exists(src_path) else 0
-        src_size  = os.path.getsize(src_path)  if os.path.exists(src_path) else 0
-    except Exception:
-        src_mtime = 0
-        src_size  = 0
-
-    records[index]["archive_path"]      = archive_path
-    records[index]["archive_date"]      = datetime.now().strftime(
-        "%Y-%m-%d %H:%M:%S")
-    records[index]["archive_src_mtime"] = src_mtime
-    records[index]["archive_src_size"]  = src_size
-    records[index]["archive_method"]    = method
-
-    save_manifest(data)
-    _safe_log("Archive record updated [{0}][{1}]: {2}".format(
-        section, index, archive_path))
-    return True
+# update_archive_record — see updated version below
 
 
 def clear_archive_record(section, index):
@@ -803,3 +741,233 @@ def get_archive_candidates(open_project_path=None):
             })
 
     return candidates
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  ZIP archive  (Proposal 2 — Windows-native compress, no ANSYS dependency)
+# ────────────────────────────────────────────────────────────────────────────
+
+# File extensions that are result/solver output files — excluded when the
+# user chooses "Exclude result files".  The MECH folder structure is:
+#   dp0/SYS-XX/MECH/        <- files HERE are solver outputs
+#   dp0/SYS-XX/MECH/Solution 1/   <- subfolders are kept
+# We exclude files in any MECH directory that are not inside a subfolder.
+_RESULT_FILE_EXTENSIONS = {
+    ".rst", ".rth", ".rmg", ".rfl",   # ANSYS result files
+    ".dat", ".r001", ".esav", ".emat", # solver input/scratch
+    ".db",                              # database (large)
+    ".out", ".err",                     # text output
+    ".DSP", ".full", ".sub",            # other solver files
+    ".mntr", ".stat",                   # monitor / status
+    ".cas", ".dat.gz",                  # Fluent
+    ".cff", ".res", ".trn",             # CFX
+}
+
+
+def _is_result_file(rel_path):
+    """
+    Return True if rel_path is a solver result file that should be excluded
+    when archiving without results.
+
+    Rule: exclude files whose parent folder is named MECH (or ends with /MECH)
+    AND whose extension is in _RESULT_FILE_EXTENSIONS.
+    Files inside MECH/Solution X/ subfolders are NOT excluded.
+    """
+    parts = rel_path.replace("/", "\\").split("\\")
+    ext   = os.path.splitext(rel_path)[1].lower()
+
+    # Find if any parent component is "MECH" and the file is a direct child
+    # (i.e. the component immediately before the filename is "MECH")
+    if len(parts) >= 2:
+        parent = parts[-2].upper()
+        if parent == "MECH" and ext in _RESULT_FILE_EXTENSIONS:
+            return True
+    return False
+
+
+def zip_wbpj_with_files(wbpj_path, dest_dir, include_results=False,
+                         progress_callback=None):
+    """
+    Create a ZIP archive of a .wbpj file and its associated _files folder.
+    Stored as <ProjectName>.zip in dest_dir.
+
+    progress_callback: optional callable(current_file_name) called per file
+                       so the UI can update a progress label.
+
+    Returns the path of the created .zip file.
+    """
+    import zipfile
+
+    if not os.path.exists(wbpj_path):
+        raise IOError("Source .wbpj not found: " + wbpj_path)
+
+    if not os.path.exists(dest_dir):
+        os.makedirs(dest_dir)
+
+    project_name = os.path.splitext(os.path.basename(wbpj_path))[0]
+    zip_path     = os.path.join(dest_dir, project_name + ".zip")
+    base_dir     = os.path.dirname(wbpj_path)
+    files_dir    = os.path.join(base_dir, project_name + "_files")
+
+    _safe_log("Creating ZIP: {0}".format(zip_path))
+    _safe_log("include_results={0}".format(include_results))
+
+    file_count   = 0
+    skip_count   = 0
+
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED,
+                         allowZip64=True) as zf:
+
+        # Add the .wbpj file itself
+        arcname = os.path.basename(wbpj_path)
+        zf.write(wbpj_path, arcname)
+        file_count += 1
+        if progress_callback:
+            progress_callback(arcname)
+
+        # Add the _files folder
+        if os.path.isdir(files_dir):
+            for root, dirs, files in os.walk(files_dir):
+                # Sort for deterministic output
+                dirs.sort()
+                files.sort()
+                for fname in files:
+                    full_path = os.path.join(root, fname)
+                    # arcname relative to the parent of the .wbpj
+                    arcname = os.path.relpath(full_path, base_dir)
+
+                    if not include_results and _is_result_file(arcname):
+                        skip_count += 1
+                        continue
+
+                    try:
+                        zf.write(full_path, arcname)
+                        file_count += 1
+                        if progress_callback:
+                            progress_callback(fname)
+                    except Exception as exc:
+                        _safe_log("ZIP: skipping {0}: {1}".format(
+                            full_path, str(exc)))
+
+    _safe_log("ZIP complete: {0} files added, {1} result files skipped".format(
+        file_count, skip_count))
+    return zip_path
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  _files folder mtime tracking  (for accurate out-of-date detection)
+# ────────────────────────────────────────────────────────────────────────────
+
+def get_wbpj_latest_mtime(wbpj_path):
+    """
+    Return the modification time of the most recently changed file in the
+    .wbpj file OR its associated _files folder — whichever is newer.
+    This is used as the archive baseline so that any change to any file
+    in the project triggers an "Archived ✘ — Source Changed" status.
+    """
+    latest = 0.0
+
+    try:
+        if os.path.exists(wbpj_path):
+            latest = max(latest, os.path.getmtime(wbpj_path))
+    except Exception:
+        pass
+
+    base      = os.path.splitext(wbpj_path)[0]
+    files_dir = base + "_files"
+
+    if os.path.isdir(files_dir):
+        try:
+            for root, dirs, files in os.walk(files_dir):
+                for f in files:
+                    try:
+                        mtime = os.path.getmtime(os.path.join(root, f))
+                        if mtime > latest:
+                            latest = mtime
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    return latest
+
+
+def update_archive_record(section, index, archive_path, method):
+    """
+    Write archive metadata into the manifest record at [section][index].
+
+    method: "wbpz" | "copy_with_files" | "zip" | "copy"
+
+    For .wbpj methods (copy_with_files, zip, wbpz), store the latest mtime
+    across the entire _files tree rather than just the .wbpj file itself,
+    so that any change to any project file triggers out-of-date detection.
+    """
+    data    = load_manifest()
+    records = data["sections"].get(section, [])
+    if index < 0 or index >= len(records):
+        _safe_log("update_archive_record: index out of range")
+        return False
+
+    src_path = records[index].get("source_path", "")
+    ext      = os.path.splitext(src_path)[1].lower() if src_path else ""
+
+    try:
+        if ext == ".wbpj" and method in ("copy_with_files", "zip", "wbpz"):
+            # Use full project mtime (wbpj + all _files)
+            src_mtime = get_wbpj_latest_mtime(src_path)
+        elif os.path.exists(src_path):
+            src_mtime = os.path.getmtime(src_path)
+        else:
+            src_mtime = 0
+    except Exception:
+        src_mtime = 0
+
+    try:
+        src_size = os.path.getsize(src_path) if os.path.exists(src_path) else 0
+    except Exception:
+        src_size = 0
+
+    records[index]["archive_path"]      = archive_path
+    records[index]["archive_date"]      = datetime.now().strftime(
+        "%Y-%m-%d %H:%M:%S")
+    records[index]["archive_src_mtime"] = src_mtime
+    records[index]["archive_src_size"]  = src_size
+    records[index]["archive_method"]    = method
+
+    save_manifest(data)
+    _safe_log("Archive record updated [{0}][{1}]: {2}  (mtime={3})".format(
+        section, index, archive_path, int(src_mtime)))
+    return True
+
+
+def get_archive_status(record):
+    """
+    Return the archive status string for a record.
+    For .wbpj records, compares the full project mtime (wbpj + _files tree)
+    against the stored archive baseline.
+    """
+    src_path = record.get("source_path", "")
+
+    if not src_path or not os.path.exists(src_path):
+        return ARCH_STATUS_MISSING
+
+    archive_path = record.get("archive_path", "")
+    if not archive_path or not os.path.exists(archive_path):
+        return ARCH_STATUS_NONE
+
+    try:
+        ext    = os.path.splitext(src_path)[1].lower()
+        method = record.get("archive_method", "copy")
+
+        if ext == ".wbpj" and method in ("copy_with_files", "zip", "wbpz"):
+            current_mtime = get_wbpj_latest_mtime(src_path)
+        else:
+            current_mtime = os.path.getmtime(src_path)
+
+        archived_mtime = record.get("archive_src_mtime", 0)
+        if abs(current_mtime - archived_mtime) > 2:
+            return ARCH_STATUS_OUTDATED
+    except Exception:
+        return ARCH_STATUS_OUTDATED
+
+    return ARCH_STATUS_OK

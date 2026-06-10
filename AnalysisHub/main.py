@@ -198,6 +198,7 @@ _CLR_ARCHIVED_OK = Drawing.Color.FromArgb(0,   102, 204)   # blue
 _CLR_ARCHIVED_OLD= Drawing.Color.FromArgb(200, 100,   0)   # orange
 _CLR_ROW_ALT     = Drawing.Color.FromArgb(245, 247, 250)
 _CLR_WARN_BG     = Drawing.Color.FromArgb(255, 244, 206)   # pale amber
+_CLR_GREEN_DIM   = Drawing.Color.FromArgb(0,   128,   0)   # recommended badge
 
 _FONT_NORMAL = Drawing.Font("Segoe UI",  9.5)
 _FONT_BOLD   = Drawing.Font("Segoe UI",  9.5, Drawing.FontStyle.Bold)
@@ -632,6 +633,7 @@ class ArchiveDialog(WinForms.Form):
     """
 
     # wbpj method constants
+    WBPJ_ZIP            = "zip"
     WBPJ_USE_WBPZ       = "wbpz"
     WBPJ_COPY_WITH_FILES = "copy_with_files"
     WBPJ_SKIP           = "skip"
@@ -720,43 +722,65 @@ class ArchiveDialog(WinForms.Form):
         panel = WinForms.GroupBox()
         panel.Text     = "Workbench Project (.wbpj) Archive Method"
         panel.Location = Drawing.Point(16, top_y)
-        panel.Size     = Drawing.Size(854, 120)
+        panel.Size     = Drawing.Size(854, 152)
         panel.Font     = _FONT_NORMAL
 
-        self._rb_wbpz = WinForms.RadioButton()
-        self._rb_wbpz.Text     = (u"ANSYS ARCHIVE \u2192 produce self-contained "
-                                   u".wbpz  (recommended)")
-        self._rb_wbpz.Location = Drawing.Point(12, 22)
-        self._rb_wbpz.Size     = Drawing.Size(500, 20)
-        self._rb_wbpz.Checked  = True
-        panel.Controls.Add(self._rb_wbpz)
+        # ── Option 1: Compress to ZIP (recommended) ──
+        self._rb_zip = WinForms.RadioButton()
+        self._rb_zip.Text     = u"Compress to ZIP  (recommended \u2014 works with any project)"
+        self._rb_zip.Location = Drawing.Point(12, 20)
+        self._rb_zip.Size     = Drawing.Size(600, 20)
+        self._rb_zip.Checked  = True
+        panel.Controls.Add(self._rb_zip)
+
+        lbl_zip_rec = WinForms.Label()
+        lbl_zip_rec.Text      = u"\u2714 Recommended"
+        lbl_zip_rec.ForeColor = _CLR_GREEN_DIM
+        lbl_zip_rec.Font      = _FONT_BOLD
+        lbl_zip_rec.Location  = Drawing.Point(620, 22)
+        lbl_zip_rec.AutoSize  = True
+        panel.Controls.Add(lbl_zip_rec)
 
         self._chk_results = WinForms.CheckBox()
-        self._chk_results.Text     = "Include result files"
-        self._chk_results.Location = Drawing.Point(40, 46)
-        self._chk_results.Size     = Drawing.Size(160, 20)
+        self._chk_results.Text     = "Include result files (.rst, .db, etc.)"
+        self._chk_results.Location = Drawing.Point(34, 44)
+        self._chk_results.Size     = Drawing.Size(260, 20)
         self._chk_results.Checked  = False
         panel.Controls.Add(self._chk_results)
 
-        self._chk_external = WinForms.CheckBox()
-        self._chk_external.Text     = "Include external files"
-        self._chk_external.Location = Drawing.Point(210, 46)
-        self._chk_external.Size     = Drawing.Size(160, 20)
-        self._chk_external.Checked  = True
-        panel.Controls.Add(self._chk_external)
+        lbl_zip_note = WinForms.Label()
+        lbl_zip_note.Text      = ("Output: ProjectName.zip in the archive folder. "
+                                   "Open by extracting, then opening the .wbpj.")
+        lbl_zip_note.Font      = _FONT_SMALL
+        lbl_zip_note.ForeColor = Drawing.Color.Gray
+        lbl_zip_note.Location  = Drawing.Point(34, 66)
+        lbl_zip_note.Size      = Drawing.Size(800, 16)
+        panel.Controls.Add(lbl_zip_note)
 
+        # ── Option 2: Guided Manual ARCHIVE ──
+        self._rb_wbpz = WinForms.RadioButton()
+        self._rb_wbpz.Text     = (u"Guided Manual ANSYS ARCHIVE \u2192 .wbpz  "
+                                   u"(requires manual steps)")
+        self._rb_wbpz.Location = Drawing.Point(12, 90)
+        self._rb_wbpz.Size     = Drawing.Size(600, 20)
+        panel.Controls.Add(self._rb_wbpz)
+
+        lbl_wbpz_note = WinForms.Label()
+        lbl_wbpz_note.Text      = (u"\u26A0 Requires the project to be clean "
+                                    u"(saved, no dialogs, no missing files).")
+        lbl_wbpz_note.Font      = _FONT_SMALL
+        lbl_wbpz_note.ForeColor = _CLR_ARCHIVED_OLD
+        lbl_wbpz_note.Location  = Drawing.Point(34, 112)
+        lbl_wbpz_note.Size      = Drawing.Size(800, 16)
+        panel.Controls.Add(lbl_wbpz_note)
+
+        # ── Option 3: Copy with _files ──
         self._rb_copy = WinForms.RadioButton()
-        self._rb_copy.Text     = ("Copy .wbpj + _files folder  "
-                                   "(preserves references, may be large)")
-        self._rb_copy.Location = Drawing.Point(12, 72)
-        self._rb_copy.Size     = Drawing.Size(500, 20)
+        self._rb_copy.Text     = (u"Copy .wbpj + _files folder  "
+                                   u"(largest, no compression)")
+        self._rb_copy.Location = Drawing.Point(12, 132)
+        self._rb_copy.Size     = Drawing.Size(600, 20)
         panel.Controls.Add(self._rb_copy)
-
-        self._rb_skip = WinForms.RadioButton()
-        self._rb_skip.Text     = "Skip .wbpj files (leave as references only)"
-        self._rb_skip.Location = Drawing.Point(12, 96)
-        self._rb_skip.Size     = Drawing.Size(500, 20)
-        panel.Controls.Add(self._rb_skip)
 
         return panel
 
@@ -808,6 +832,8 @@ class ArchiveDialog(WinForms.Form):
     def _get_wbpj_method(self):
         if self._wbpj_panel is None:
             return self.WBPJ_SKIP
+        if self._rb_zip.Checked:
+            return self.WBPJ_ZIP
         if self._rb_wbpz.Checked:
             return self.WBPJ_USE_WBPZ
         if self._rb_copy.Checked:
@@ -858,8 +884,9 @@ class ArchiveDialog(WinForms.Form):
                 WinForms.MessageBoxIcon.Warning)
             return
 
-        successes = []
-        failures  = []
+        successes      = []
+        failures       = []
+        self._guided_items = []   # .wbpj items queued for guided manual ARCHIVE
 
         for c in checked:
             section  = c["section"]
@@ -870,15 +897,33 @@ class ArchiveDialog(WinForms.Form):
 
             try:
                 if c["is_wbpj"]:
-                    if wbpj_method == self.WBPJ_USE_WBPZ:
-                        dest_path = self._archive_via_wbpz(
-                            src, dest_dir, runwb2,
-                            self._chk_results.Checked,
-                            self._chk_external.Checked,
-                            label)
-                        method = "wbpz"
+                    if wbpj_method == self.WBPJ_ZIP:
+                        # ZIP compression — works with any project state
+                        prog = ArchiveProgressDialog(
+                            u"Compressing: {0}".format(label))
+                        prog.Show()
+                        WinForms.Application.DoEvents()
+
+                        def _zip_progress(fname):
+                            prog.set_status(u"Adding: {0}".format(fname))
+
+                        dest_path = repo.zip_wbpj_with_files(
+                            src, dest_dir,
+                            include_results=self._chk_results.Checked,
+                            progress_callback=_zip_progress)
+                        prog.finish_success()
+                        method = "zip"
+
+                    elif wbpj_method == self.WBPJ_USE_WBPZ:
+                        # Guided manual ARCHIVE — open a separate dialog
+                        # Close this dialog first, then show guided steps
+                        self._pending_guided = {"src": src, "dest_dir": dest_dir,
+                                                 "label": label, "section": section,
+                                                 "index": index}
+                        self._guided_items.append(self._pending_guided)
+                        continue   # handled after main loop via guided dialog
+
                     elif wbpj_method == self.WBPJ_COPY_WITH_FILES:
-                        # Show progress for potentially large folder copy
                         prog = ArchiveProgressDialog(
                             u"Copying: {0}".format(label))
                         prog.Show()
@@ -886,10 +931,10 @@ class ArchiveDialog(WinForms.Form):
                         WinForms.Application.DoEvents()
                         dest_path = repo.copy_wbpj_with_files(src, dest_dir)
                         prog.finish_success()
-                        method    = "copy_with_files"
+                        method = "copy_with_files"
+
                     else:
-                        # Skip
-                        continue
+                        continue   # skip
                 else:
                     # Show progress for regular file copy
                     size_mb = c.get("source_size_bytes", 0) / (1024.0 * 1024)
@@ -931,6 +976,21 @@ class ArchiveDialog(WinForms.Form):
             else WinForms.MessageBoxIcon.Warning)
 
         self._archived_results = successes
+
+        # Launch guided ARCHIVE dialog for any .wbpj items that need it
+        if self._guided_items:
+            self.Hide()
+            for item in self._guided_items:
+                gdlg = GuidedArchiveDialog(
+                    item["src"], item["dest_dir"], item["label"])
+                gdlg.ShowDialog()
+                if gdlg.archive_confirmed:
+                    repo.update_archive_record(
+                        item["section"], item["index"],
+                        gdlg.confirmed_path, "wbpz")
+                    successes.append(item["label"] + " (manual .wbpz)")
+            self._archived_results = successes
+
         self.DialogResult = WinForms.DialogResult.OK
         self.Close()
 
@@ -1022,6 +1082,214 @@ class ArchiveDialog(WinForms.Form):
 #  Project-info panel  (with Status change handler)
 # ────────────────────────────────────────────────────────────────────────────
 
+
+
+# ----------------------------------------------------------------------------
+#  Guided Manual ARCHIVE dialog  (Proposal 1)
+# ----------------------------------------------------------------------------
+
+class GuidedArchiveDialog(WinForms.Form):
+    """
+    Step-by-step instructions for manually running ANSYS ARCHIVE on a
+    referenced .wbpj file. The user follows the steps, saves the .wbpz
+    to the displayed directory, then clicks Archive Complete.
+    We then scan for the .wbpz and update the manifest.
+    """
+
+    def __init__(self, wbpj_path, dest_dir, label):
+        self._wbpj_path        = wbpj_path
+        self._dest_dir         = dest_dir
+        self._label            = label
+        self.archive_confirmed = False
+        self.confirmed_path    = ''
+
+        self.Text          = u'Guided ANSYS ARCHIVE: {0}'.format(label)
+        self.Width         = 720
+        self.Height        = 560
+        self.StartPosition = WinForms.FormStartPosition.CenterParent
+        self.MinimizeBox   = True
+        self.MaximizeBox   = False
+        self.BackColor     = Drawing.Color.White
+        self.Font          = _FONT_NORMAL
+
+        self._build_ui()
+
+    def _build_ui(self):
+        y = 16
+
+        lbl_title = WinForms.Label()
+        lbl_title.Text      = u'Guided ANSYS ARCHIVE Process'
+        lbl_title.Font      = _FONT_TITLE
+        lbl_title.ForeColor = _CLR_ANSYS_BLUE
+        lbl_title.Location  = Drawing.Point(16, y)
+        lbl_title.AutoSize  = True
+        self.Controls.Add(lbl_title)
+        y += 36
+
+        lbl_sub = WinForms.Label()
+        lbl_sub.Text      = ('This process requires manual steps inside '
+                              'ANSYS Workbench. Follow the instructions below.')
+        lbl_sub.Font      = _FONT_SMALL
+        lbl_sub.ForeColor = Drawing.Color.Gray
+        lbl_sub.Location  = Drawing.Point(16, y)
+        lbl_sub.Size      = Drawing.Size(670, 18)
+        self.Controls.Add(lbl_sub)
+        y += 30
+
+        # Warning box
+        warn = WinForms.Panel()
+        warn.BackColor   = Drawing.Color.FromArgb(255, 244, 206)
+        warn.BorderStyle = WinForms.BorderStyle.FixedSingle
+        warn.Location    = Drawing.Point(16, y)
+        warn.Size        = Drawing.Size(670, 44)
+        lbl_warn = WinForms.Label()
+        lbl_warn.Text      = (u'\u26A0  Do NOT click \u201cArchive Complete\u201d '
+                               u'until AFTER you have saved the .wbpz file. '
+                               u'That button scans for the output file.')
+        lbl_warn.Font      = _FONT_SMALL
+        lbl_warn.ForeColor = Drawing.Color.FromArgb(120, 80, 0)
+        lbl_warn.Location  = Drawing.Point(6, 6)
+        lbl_warn.Size      = Drawing.Size(656, 30)
+        warn.Controls.Add(lbl_warn)
+        self.Controls.Add(warn)
+        y += 54
+
+        project_name  = os.path.splitext(os.path.basename(self._wbpj_path))[0]
+        expected_wbpz = os.path.join(self._dest_dir, project_name + '.wbpz')
+        self._expected_wbpz = expected_wbpz
+
+        steps = [
+            (u'1.', u'Click \u201cOpen Project\u201d below to launch the referenced database.'),
+            (u'2.', u'Dismiss any warnings or dialogs (missing files, version migration, etc.). Save the project if prompted.'),
+            (u'3.', u'In Workbench, go to:  File \u2192 Archive...'),
+            (u'4.', u'Set the Save Location to:\n   {0}'.format(self._dest_dir)),
+            (u'5.', u'Set the filename to:\n   {0}'.format(project_name + '.wbpz')),
+            (u'6.', u'Choose your result file preference and click Archive.'),
+            (u'7.', u'Return to this window and click \u201cArchive Complete \u2014 Update Repository\u201d.'),
+        ]
+
+        for num, text in steps:
+            pnl = WinForms.Panel()
+            pnl.Location = Drawing.Point(16, y)
+            pnl.Size     = Drawing.Size(670, 50)
+            lbl_num = WinForms.Label()
+            lbl_num.Text      = num
+            lbl_num.Font      = _FONT_BOLD
+            lbl_num.ForeColor = _CLR_ANSYS_BLUE
+            lbl_num.Location  = Drawing.Point(0, 4)
+            lbl_num.Size      = Drawing.Size(24, 20)
+            pnl.Controls.Add(lbl_num)
+            lbl_txt = WinForms.Label()
+            lbl_txt.Text     = text
+            lbl_txt.Font     = _FONT_NORMAL
+            lbl_txt.Location = Drawing.Point(28, 4)
+            lbl_txt.Size     = Drawing.Size(640, 44)
+            pnl.Controls.Add(lbl_txt)
+            self.Controls.Add(pnl)
+            y += 54
+
+        y += 8
+
+        lbl_exp = WinForms.Label()
+        lbl_exp.Text     = 'Expected output location:'
+        lbl_exp.Font     = _FONT_BOLD
+        lbl_exp.Location = Drawing.Point(16, y)
+        lbl_exp.AutoSize = True
+        self.Controls.Add(lbl_exp)
+        y += 22
+
+        tb_path = WinForms.TextBox()
+        tb_path.Text      = expected_wbpz
+        tb_path.ReadOnly  = True
+        tb_path.BackColor = Drawing.Color.FromArgb(240, 240, 240)
+        tb_path.Font      = _FONT_SMALL
+        tb_path.Location  = Drawing.Point(16, y)
+        tb_path.Size      = Drawing.Size(560, 22)
+        self.Controls.Add(tb_path)
+
+        self.Controls.Add(_make_btn(u'Copy Path', 584, y - 1, 90, 24,
+                                    handler=self._copy_path))
+        y += 34
+
+        self.Controls.Add(_make_btn(u'\u25B6  Open Project', 16, y,
+                                    160, 36, primary=True,
+                                    handler=self._open_project))
+
+        self.Controls.Add(_make_btn(u'Open Archive Folder', 184, y,
+                                    160, 36, handler=self._open_dest_dir))
+
+        self._btn_complete = _make_btn(
+            u'\u2714  Archive Complete \u2014 Update Repository',
+            16, y + 44, 340, 36, handler=self._on_complete)
+        self._btn_complete.ForeColor = _CLR_GREEN_DIM
+        self._btn_complete.Font      = _FONT_BOLD
+        self.Controls.Add(self._btn_complete)
+
+        self.Controls.Add(_make_btn('Cancel / Skip', 364, y + 44,
+                                    130, 36,
+                                    handler=lambda s, e: self.Close()))
+
+        self.Height = y + 130
+
+    def _copy_path(self, s, e):
+        try:
+            WinForms.Clipboard.SetText(self._expected_wbpz)
+        except Exception:
+            pass
+
+    def _open_project(self, s, e):
+        try:
+            _smart_open_file(self._wbpj_path)
+        except Exception as exc:
+            WinForms.MessageBox.Show('Could not open project:\n' + str(exc),
+                                      'Open Error')
+
+    def _open_dest_dir(self, s, e):
+        try:
+            if not os.path.exists(self._dest_dir):
+                os.makedirs(self._dest_dir)
+            os.startfile(self._dest_dir)
+        except Exception as exc:
+            WinForms.MessageBox.Show('Could not open folder:\n' + str(exc),
+                                      'Error')
+
+    def _on_complete(self, s, e):
+        try:
+            if os.path.exists(self._expected_wbpz):
+                self.archive_confirmed = True
+                self.confirmed_path    = self._expected_wbpz
+                _log('Guided ARCHIVE confirmed: ' + self._expected_wbpz)
+                WinForms.MessageBox.Show(
+                    u'\u2714 Archive found and repository updated!\n\n'
+                    u'{0}'.format(self._expected_wbpz),
+                    'Archive Confirmed')
+                self.DialogResult = WinForms.DialogResult.OK
+                self.Close()
+            else:
+                dlg = WinForms.OpenFileDialog()
+                dlg.Title            = 'Locate the .wbpz archive file'
+                dlg.Filter           = 'Workbench Archive (*.wbpz)|*.wbpz|All Files (*.*)|*.*'
+                dlg.InitialDirectory = self._dest_dir
+                dlg.FileName         = os.path.basename(self._expected_wbpz)
+                if dlg.ShowDialog() == WinForms.DialogResult.OK:
+                    self.archive_confirmed = True
+                    self.confirmed_path    = dlg.FileName
+                    _log('Guided ARCHIVE confirmed (browsed): ' + dlg.FileName)
+                    self.DialogResult = WinForms.DialogResult.OK
+                    self.Close()
+                else:
+                    WinForms.MessageBox.Show(
+                        u'The archive file was not found at:\n\n'
+                        u'{0}\n\n'
+                        u'Complete the ANSYS ARCHIVE process first, '
+                        u'or browse to the file if saved elsewhere.'.format(
+                            self._expected_wbpz),
+                        u'File Not Found',
+                        WinForms.MessageBoxButtons.OK,
+                        WinForms.MessageBoxIcon.Warning)
+        except Exception as exc:
+            _log('GuidedArchiveDialog complete error: ' + str(exc))
+            WinForms.MessageBox.Show('Error:\n' + str(exc), 'Error')
 class ProjectInfoPanel(WinForms.Panel):
     def __init__(self, form_ref):
         self._form          = form_ref
@@ -1361,7 +1629,7 @@ class RepositoryForm(WinForms.Form):
                 240, 240, 240)
             fg   = Drawing.Color.White if is_active else Drawing.Color.FromArgb(
                 100, 100, 100)
-            font = _FONT_BOLD if is_active else _FONT_NORMAL
+            font = _FONT_BOLD if is_active else _FONT_BOLD
             e.Graphics.FillRectangle(Drawing.SolidBrush(bg), e.Bounds)
             fmt = Drawing.StringFormat()
             fmt.Alignment     = Drawing.StringAlignment.Center
