@@ -499,12 +499,13 @@ class HealthCheckDialog(WinForms.Form):
             item.SubItems.Add("No orphaned archive files found.")
             item.SubItems.Add("")
         else:
-            for o in orphans:
+            for oi, o in enumerate(orphans):
                 item = self._lv_orphans.Items.Add(
                     repo.SECTION_LABELS.get(o["section"], o["section"]))
                 item.SubItems.Add(o["filename"])
                 item.SubItems.Add(o["path"])
                 item.ForeColor = _CLR_ARCHIVED_OLD
+                item.Tag = oi   # store original index for reliable lookup
 
         self.Controls.Add(self._lv_orphans)
         y += 114
@@ -569,7 +570,12 @@ class HealthCheckDialog(WinForms.Form):
             if self._lv_orphans.SelectedItems.Count != 1:
                 return
             sel_item = self._lv_orphans.SelectedItems[0]
-            idx = sel_item.Index
+            # Use Tag (original list index) for reliable lookup,
+            # not .Index which reflects display order
+            try:
+                idx = int(sel_item.Tag)
+            except (TypeError, ValueError):
+                idx = sel_item.Index
             if idx < 0 or idx >= len(self._orphan_data):
                 return
             orphan = self._orphan_data[idx]
@@ -719,12 +725,14 @@ class ZipExtractDialog(WinForms.Form):
         self._custom = ""
 
         self.Text          = u"Extract Archive: {0}".format(label)
-        self.Width         = 660
+        self.Width         = 680
         self.Height        = 280
+        self.MinimumSize   = Drawing.Size(500, 260)
         self.StartPosition = WinForms.FormStartPosition.CenterParent
-        self.MinimizeBox = self.MaximizeBox = False
-        self.BackColor   = Drawing.Color.White
-        self.Font        = _FONT_NORMAL
+        self.MinimizeBox   = False
+        self.MaximizeBox   = True
+        self.BackColor     = Drawing.Color.White
+        self.Font          = _FONT_NORMAL
 
         lbl_hdr = WinForms.Label()
         lbl_hdr.Text = ("This file is stored as a ZIP archive. "
@@ -742,11 +750,14 @@ class ZipExtractDialog(WinForms.Form):
         self.Controls.Add(self._rb_beside)
 
         lbl_bd = WinForms.Label()
-        lbl_bd.Text = "   " + self._beside
-        lbl_bd.Font = _FONT_SMALL
-        lbl_bd.ForeColor = Drawing.Color.Gray
-        lbl_bd.Location  = Drawing.Point(28, 66)
-        lbl_bd.Size      = Drawing.Size(610, 16)
+        lbl_bd.Text         = "   " + self._beside
+        lbl_bd.Font         = _FONT_SMALL
+        lbl_bd.ForeColor    = Drawing.Color.Gray
+        lbl_bd.Location     = Drawing.Point(28, 66)
+        lbl_bd.Size         = Drawing.Size(610, 16)
+        lbl_bd.AutoEllipsis = True
+        lbl_bd.Anchor       = (WinForms.AnchorStyles.Left |
+                                WinForms.AnchorStyles.Right)
         self.Controls.Add(lbl_bd)
 
         self._rb_custom = WinForms.RadioButton()
@@ -832,6 +843,7 @@ class ZipOpenDialog(WinForms.Form):
 
     def __init__(self, zip_path, extract_path, label, source_path=""):
         self.action      = ""
+        self._other_dest = ""   # set by inline browse for OTHER_LOCATION
         self._zip_path   = zip_path
         self._extract    = extract_path
         self._source     = source_path
@@ -931,7 +943,13 @@ class ZipOpenDialog(WinForms.Form):
             self.action = self.OPEN_EXISTING
         elif self._rb_re.Checked:
             self.action = self.RE_EXTRACT
-        else:
+        elif self._rb_other.Checked:
+            # Inline browse for destination folder
+            dlg = WinForms.FolderBrowserDialog()
+            dlg.Description = "Choose extraction folder"
+            if dlg.ShowDialog() != WinForms.DialogResult.OK:
+                return
+            self._other_dest = dlg.SelectedPath
             self.action = self.OTHER_LOCATION
         self.DialogResult = WinForms.DialogResult.OK
         self.Close()
@@ -992,11 +1010,19 @@ class ArchiveDialog(WinForms.Form):
         self._lv.Location      = Drawing.Point(16, y)
         self._lv.Size          = Drawing.Size(880, 220)
         self._lv.Font          = _FONT_NORMAL
-        self._lv.HeaderStyle   = WinForms.ColumnHeaderStyle.Nonclickable
+        self._lv.HeaderStyle   = WinForms.ColumnHeaderStyle.Clickable
+        self._lv.Anchor        = (WinForms.AnchorStyles.Top    |
+                                   WinForms.AnchorStyles.Bottom |
+                                   WinForms.AnchorStyles.Left   |
+                                   WinForms.AnchorStyles.Right)
+        self._lv_cols = ["Section", "File Name", "Source Location", "Size", "Archive Status"]
         for name, w in [("Section", 150), ("File Name", 220),
                         ("Source Location", 240), ("Size", 80),
                         ("Archive Status", 170)]:
             self._lv.Columns.Add(name, w)
+        self._lv.ColumnClick += self._on_archive_col_click
+        self._archive_sort_col = -1
+        self._archive_sort_asc = True
         self.Controls.Add(self._lv)
         y += 230
 
@@ -1022,19 +1048,20 @@ class ArchiveDialog(WinForms.Form):
             lbl_rec.AutoSize  = True
             panel.Controls.Add(lbl_rec)
 
-            self._chk_results = WinForms.CheckBox()
-            self._chk_results.Text     = "Include result files (.rst, .db, etc.)"
-            self._chk_results.Location = Drawing.Point(34, 44)
-            self._chk_results.Size     = Drawing.Size(280, 20)
-            self._chk_results.Checked  = False
-            panel.Controls.Add(self._chk_results)
-
             self._rb_copy = WinForms.RadioButton()
             self._rb_copy.Text     = ("Copy .wbpj + _files  "
                                       "(no compression, delta update on re-archive)")
-            self._rb_copy.Location = Drawing.Point(12, 70)
+            self._rb_copy.Location = Drawing.Point(12, 46)
             self._rb_copy.Size     = Drawing.Size(600, 20)
             panel.Controls.Add(self._rb_copy)
+
+            # Results checkbox applies to BOTH methods
+            self._chk_results = WinForms.CheckBox()
+            self._chk_results.Text     = u"Include result files (.rst, .db, etc.)  \u2014 applies to ZIP and Copy"
+            self._chk_results.Location = Drawing.Point(12, 72)
+            self._chk_results.Size     = Drawing.Size(560, 20)
+            self._chk_results.Checked  = False
+            panel.Controls.Add(self._chk_results)
 
             self.Controls.Add(panel)
             y += 110
@@ -1072,6 +1099,41 @@ class ArchiveDialog(WinForms.Form):
             item.SubItems.Add(status)
             item.Checked = (repo.ARCH_STATUS_OK not in status)
             self._lv.Items.Add(item)
+
+    def _on_archive_col_click(self, s, e):
+        """Sort the archive candidate list by clicked column."""
+        try:
+            col = e.Column
+            if self._archive_sort_col == col:
+                self._archive_sort_asc = not self._archive_sort_asc
+            else:
+                self._archive_sort_col = col
+                self._archive_sort_asc = True
+
+            items = []
+            for i in range(self._lv.Items.Count):
+                item = self._lv.Items[i]
+                checked = item.Checked
+                row = [item.Text] + [item.SubItems[j].Text
+                                     for j in range(1, item.SubItems.Count)]
+                items.append((row, checked, item.ForeColor))
+
+            def sort_key(t):
+                val = t[0][col] if col < len(t[0]) else ""
+                return val.lower()
+
+            items.sort(key=sort_key, reverse=not self._archive_sort_asc)
+
+            self._lv.Items.Clear()
+            for row, checked, colour in items:
+                item = WinForms.ListViewItem(row[0])
+                item.ForeColor = colour
+                for cell in row[1:]:
+                    item.SubItems.Add(cell)
+                item.Checked = checked
+                self._lv.Items.Add(item)
+        except Exception as exc:
+            pass   # sort failure is non-fatal
 
     def _check_all(self, s, e):
         for i in range(self._lv.Items.Count):
@@ -1809,8 +1871,14 @@ class RepositoryForm(WinForms.Form):
                 self._do_extract(section, index, target["archive_path"],
                                  extract_dir)
             elif dlg.action == ZipOpenDialog.OTHER_LOCATION:
-                self._extract_and_open(section, index, record,
-                                       target["archive_path"])
+                # Use the folder the user browsed to inline in ZipOpenDialog
+                other_dest = getattr(dlg, "_other_dest", "")
+                if other_dest:
+                    self._do_extract(section, index, target["archive_path"],
+                                     other_dest)
+                else:
+                    self._extract_and_open(section, index, record,
+                                           target["archive_path"])
 
     def _extract_and_open(self, section, index, record, zip_path):
         dlg = ZipExtractDialog(zip_path, record.get("label", ""))
@@ -2009,20 +2077,31 @@ class RepositoryForm(WinForms.Form):
                     ) != WinForms.DialogResult.Yes:
                 return
 
-            for idx, record in sorted(sel, key=lambda t: t[0], reverse=True):
+            # ── Per-record archive-delete prompt ──────────────────────────────
+            # Collect decisions BEFORE any removes so indices stay stable.
+            # Keyed by source_path so we can re-locate the record after the
+            # manifest reloads (index shifting bug fix).
+            delete_archive = {}   # source_path -> bool
+            for idx, record in sel:
                 arch_abs = record.get("archive_path_abs", "")
                 if arch_abs and os.path.exists(arch_abs):
+                    label = record.get("label", os.path.basename(arch_abs))
                     res = WinForms.MessageBox.Show(
-                        u"Also delete the archived copy from the repository?\n\n"
-                        u"{0}".format(arch_abs),
+                        u"Also delete the archived copy from the "
+                        u"repository for \"{0}\"?\n\n{1}".format(
+                            label, arch_abs),
                         u"Delete Archive Copy?",
                         WinForms.MessageBoxButtons.YesNo,
                         WinForms.MessageBoxIcon.Question)
-                    removed = repo.remove_file_record(self._cur_section, idx)
-                    if removed and res == WinForms.DialogResult.Yes:
-                        repo.delete_archive_file(removed)
-                else:
-                    repo.remove_file_record(self._cur_section, idx)
+                    delete_archive[record.get("source_path", "")] = (
+                        res == WinForms.DialogResult.Yes)
+
+            # Remove in reverse index order so earlier indices stay valid
+            for idx, record in sorted(sel, key=lambda t: t[0], reverse=True):
+                removed = repo.remove_file_record(self._cur_section, idx)
+                src_key = record.get("source_path", "")
+                if removed and delete_archive.get(src_key, False):
+                    repo.delete_archive_file(removed)
 
             self._refresh_all(None, None)
         except Exception as exc:

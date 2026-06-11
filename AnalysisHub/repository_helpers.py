@@ -761,7 +761,12 @@ def get_open_target(record):
     has_extract = bool(ext_path) and os.path.exists(ext_path)
 
     if is_zip and has_archive:
-        mode = "archive_zip" if has_extract else "extract_first"
+        if has_extract or has_source:
+            # archive_zip mode shows open options including source (if present)
+            mode = "archive_zip"
+        else:
+            # No extraction yet, no source on this machine -- prompt to extract
+            mode = "extract_first"
     elif has_archive and not is_zip:
         mode = "archive_direct"
     elif has_source:
@@ -802,23 +807,32 @@ def clear_archive_record(section, index):
 # ────────────────────────────────────────────────────────────────────────────
 
 def _enrich_record(record):
+    """
+    Add live display fields to a manifest record.
+
+    Priority rules
+    --------------
+    - size_mb and modified ALWAYS reflect the SOURCE file when it exists.
+      The owner always sees current reference file info for version control.
+    - When source is gone (recipient machine), size/modified show dashes.
+    - status reflects archive state (see get_archive_status).
+    - archive_path_abs, archive_date_disp, archive_method_disp
+      are exposed for the UI status column and tooltips.
+    """
     r    = dict(record)
     path = r.get("source_path", "")
 
-    # Resolve archive path for existence checks
     arch_abs = _resolve_archive_path(r.get("archive_path", ""))
 
     if not path or not os.path.exists(path):
         if arch_abs and os.path.exists(arch_abs):
-            # Source gone but archive present — show as Archived OK
-            r["status"]   = get_archive_status(record)
-            r["size_mb"]  = u"\u2014"
-            r["modified"] = u"\u2014"
+            r["status"] = get_archive_status(record)
         else:
-            r["status"]   = ARCH_STATUS_MISSING
-            r["size_mb"]  = u"\u2014"
-            r["modified"] = u"\u2014"
+            r["status"] = ARCH_STATUS_MISSING
+        r["size_mb"]  = u"\u2014"
+        r["modified"] = u"\u2014"
     else:
+        # Source exists -- show source file info (owner machine behaviour)
         r["status"] = get_archive_status(record)
         try:
             r["size_mb"] = "{0:.2f}".format(
@@ -831,8 +845,10 @@ def _enrich_record(record):
         except Exception:
             r["modified"] = u"\u2014"
 
-    # Expose resolved archive path for UI use
-    r["archive_path_abs"] = arch_abs
+    # Expose archive metadata for UI
+    r["archive_path_abs"]    = arch_abs
+    r["archive_date_disp"]   = record.get("archive_date", "")
+    r["archive_method_disp"] = record.get("archive_method", "")
     return r
 
 
