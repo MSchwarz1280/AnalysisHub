@@ -849,9 +849,15 @@ class ZipOpenDialog(WinForms.Form):
         self._source     = source_path
         self._has_source = bool(source_path) and os.path.exists(source_path)
 
+        self._has_extract = bool(extract_path) and os.path.exists(extract_path)
         self.Text          = u"Open: {0}".format(label)
+        # Height depends on how many options are shown
+        h = 44  # header
+        if self._has_source:   h += 52
+        if self._has_extract:  h += 52
+        h += 36 + 36 + 70     # re-extract, other, buttons
+        self.Height        = h
         self.Width         = 680
-        self.Height        = 320 if self._has_source else 280
         self.StartPosition = WinForms.FormStartPosition.CenterParent
         self.MinimizeBox = self.MaximizeBox = False
         self.BackColor   = Drawing.Color.White
@@ -889,32 +895,37 @@ class ZipOpenDialog(WinForms.Form):
         else:
             self._rb_src = None
 
-        self._rb_open = WinForms.RadioButton()
-        self._rb_open.Text     = "Open existing extracted copy"
-        self._rb_open.Location = Drawing.Point(16, y)
-        self._rb_open.Size     = Drawing.Size(500, 20)
-        if not self._has_source:
-            self._rb_open.Checked = True
-        self.Controls.Add(self._rb_open)
-        lbl_ep = WinForms.Label()
-        lbl_ep.Text = "   " + extract_path
-        lbl_ep.Font = _FONT_SMALL
-        lbl_ep.ForeColor = Drawing.Color.Gray
-        lbl_ep.Location  = Drawing.Point(28, y + 22)
-        lbl_ep.Size      = Drawing.Size(630, 16)
-        self.Controls.Add(lbl_ep)
-        sep1 = WinForms.Label()
-        sep1.BorderStyle = WinForms.BorderStyle.Fixed3D
-        sep1.Location = Drawing.Point(16, y + 44)
-        sep1.Size     = Drawing.Size(640, 2)
-        self.Controls.Add(sep1)
-        y += 52
+        self._rb_open = None   # may remain None if no extract exists
+        if self._has_extract:
+            self._rb_open = WinForms.RadioButton()
+            self._rb_open.Text     = "Open existing extracted copy"
+            self._rb_open.Location = Drawing.Point(16, y)
+            self._rb_open.Size     = Drawing.Size(500, 20)
+            if not self._has_source:
+                self._rb_open.Checked = True
+            self.Controls.Add(self._rb_open)
+            lbl_ep = WinForms.Label()
+            lbl_ep.Text = "   " + extract_path
+            lbl_ep.Font = _FONT_SMALL
+            lbl_ep.ForeColor = Drawing.Color.Gray
+            lbl_ep.Location  = Drawing.Point(28, y + 22)
+            lbl_ep.Size      = Drawing.Size(630, 16)
+            self.Controls.Add(lbl_ep)
+            sep1 = WinForms.Label()
+            sep1.BorderStyle = WinForms.BorderStyle.Fixed3D
+            sep1.Location = Drawing.Point(16, y + 44)
+            sep1.Size     = Drawing.Size(640, 2)
+            self.Controls.Add(sep1)
+            y += 52
 
         self._rb_re = WinForms.RadioButton()
-        self._rb_re.Text     = (u"Re-extract from ZIP  "
-                                u"(use if ZIP was updated since last extraction)")
+        self._rb_re.Text     = (u"Extract to repository folder  "
+                                u"(extract / re-extract ZIP here)")
         self._rb_re.Location = Drawing.Point(16, y)
         self._rb_re.Size     = Drawing.Size(580, 20)
+        # Default to re-extract when no source and no existing extract
+        if not self._has_source and not self._has_extract:
+            self._rb_re.Checked = True
         self.Controls.Add(self._rb_re)
         sep2 = WinForms.Label()
         sep2.BorderStyle = WinForms.BorderStyle.Fixed3D
@@ -939,7 +950,7 @@ class ZipOpenDialog(WinForms.Form):
     def _ok(self, s, e):
         if self._rb_src is not None and self._rb_src.Checked:
             self.action = self.OPEN_SOURCE
-        elif self._rb_open.Checked:
+        elif self._rb_open is not None and self._rb_open.Checked:
             self.action = self.OPEN_EXISTING
         elif self._rb_re.Checked:
             self.action = self.RE_EXTRACT
@@ -1026,12 +1037,27 @@ class ArchiveDialog(WinForms.Form):
         self.Controls.Add(self._lv)
         y += 230
 
+        # Bottom panel (anchored to bottom) contains wbpj options + buttons
+        # Using a bottom Panel ensures they stay visible when window is resized.
+        bottom_h = 150 if self._has_wbpj else 54
+        self._bottom_panel = WinForms.Panel()
+        self._bottom_panel.BackColor = Drawing.Color.White
+        self._bottom_panel.Anchor    = (WinForms.AnchorStyles.Bottom |
+                                         WinForms.AnchorStyles.Left  |
+                                         WinForms.AnchorStyles.Right)
+        self._bottom_panel.Height   = bottom_h
+        self._bottom_panel.Left     = 0
+        self._bottom_panel.Width    = self.Width - 16
+
         if self._has_wbpj:
             panel = WinForms.GroupBox()
             panel.Text     = "Workbench Project (.wbpj) Archive Method"
-            panel.Location = Drawing.Point(16, y)
-            panel.Size     = Drawing.Size(880, 100)
+            panel.Location = Drawing.Point(16, 0)
+            panel.Size     = Drawing.Size(850, 100)
             panel.Font     = _FONT_NORMAL
+            panel.Anchor   = (WinForms.AnchorStyles.Top  |
+                               WinForms.AnchorStyles.Left |
+                               WinForms.AnchorStyles.Right)
 
             self._rb_zip = WinForms.RadioButton()
             self._rb_zip.Text     = u"Compress to ZIP  (recommended \u2014 works with any project)"
@@ -1055,28 +1081,42 @@ class ArchiveDialog(WinForms.Form):
             self._rb_copy.Size     = Drawing.Size(600, 20)
             panel.Controls.Add(self._rb_copy)
 
-            # Results checkbox applies to BOTH methods
             self._chk_results = WinForms.CheckBox()
             self._chk_results.Text     = u"Include result files (.rst, .db, etc.)  \u2014 applies to ZIP and Copy"
             self._chk_results.Location = Drawing.Point(12, 72)
-            self._chk_results.Size     = Drawing.Size(560, 20)
+            self._chk_results.Size     = Drawing.Size(700, 20)
             self._chk_results.Checked  = False
             panel.Controls.Add(self._chk_results)
 
-            self.Controls.Add(panel)
-            y += 110
+            self._bottom_panel.Controls.Add(panel)
+            btn_top = 108
         else:
             self._rb_zip      = None
             self._rb_copy     = None
             self._chk_results = None
+            btn_top = 8
 
-        btn_y = y + 4
-        self.Controls.Add(_make_btn(u"\U0001F4E6  Archive Checked Files",
-                                    16, btn_y, 210, 36,
-                                    primary=True, handler=self._on_archive))
-        self.Controls.Add(_make_btn("Cancel", 234, btn_y, 100, 36,
-                                    handler=lambda s, e: self._cancel()))
-        self.Height = btn_y + 80
+        self._bottom_panel.Controls.Add(
+            _make_btn(u"\U0001F4E6  Archive Checked Files",
+                      16, btn_top, 210, 36,
+                      primary=True, handler=self._on_archive))
+        self._bottom_panel.Controls.Add(
+            _make_btn("Cancel", 234, btn_top, 100, 36,
+                      handler=lambda s, e: self._cancel()))
+
+        self.Controls.Add(self._bottom_panel)
+
+        # Now anchor the ListView to fill between top controls and bottom panel
+        self._lv.Anchor = (WinForms.AnchorStyles.Top    |
+                           WinForms.AnchorStyles.Bottom |
+                           WinForms.AnchorStyles.Left   |
+                           WinForms.AnchorStyles.Right)
+
+        # Size the form and position bottom panel
+        self.Height = 600 if self._has_wbpj else 480
+        self.MinimumSize = Drawing.Size(700, 400)
+        self._bottom_panel.Top = self.ClientSize.Height - bottom_h - 4
+        self.Resize += self._on_archive_dialog_resize
 
     def _populate_list(self):
         self._lv.Items.Clear()
@@ -1099,6 +1139,15 @@ class ArchiveDialog(WinForms.Form):
             item.SubItems.Add(status)
             item.Checked = (repo.ARCH_STATUS_OK not in status)
             self._lv.Items.Add(item)
+
+    def _on_archive_dialog_resize(self, s, e):
+        """Keep bottom panel pinned to bottom when dialog is resized."""
+        try:
+            bottom_h = self._bottom_panel.Height
+            self._bottom_panel.Top   = self.ClientSize.Height - bottom_h - 4
+            self._bottom_panel.Width = self.ClientSize.Width - 32
+        except Exception:
+            pass
 
     def _on_archive_col_click(self, s, e):
         """Sort the archive candidate list by clicked column."""
@@ -1733,13 +1782,20 @@ class RepositoryForm(WinForms.Form):
         return self._listviews.get(self._cur_section)
 
     def _selected_records(self):
+        """
+        Return list of (manifest_index, record) for selected rows.
+        Uses record["manifest_index"] — the stable manifest position —
+        NOT item.Index which is the display row and changes with sorting.
+        """
         lv      = self._current_lv()
         records = self._section_data.get(self._cur_section, [])
         result  = []
         for item in lv.SelectedItems:
-            idx = item.Index
-            if 0 <= idx < len(records):
-                result.append((idx, records[idx]))
+            disp_idx = item.Index
+            if 0 <= disp_idx < len(records):
+                rec = records[disp_idx]
+                manifest_idx = rec.get("manifest_index", disp_idx)
+                result.append((manifest_idx, rec))
         return result
 
     def _on_list_mouse_up(self, s, e):
@@ -1754,11 +1810,12 @@ class RepositoryForm(WinForms.Form):
             hit.Item.Selected = True
             lv.Select()
 
-            records = self._section_data.get(sec, [])
-            idx     = hit.Item.Index
-            if idx < 0 or idx >= len(records):
+            records  = self._section_data.get(sec, [])
+            disp_idx = hit.Item.Index
+            if disp_idx < 0 or disp_idx >= len(records):
                 return
-            record   = records[idx]
+            record   = records[disp_idx]
+            idx      = record.get("manifest_index", disp_idx)  # stable manifest index
             status   = record.get("status", "")
             arch_abs = record.get("archive_path_abs", "")
             missing  = (repo.ARCH_STATUS_MISSING in status and not arch_abs)
@@ -1825,12 +1882,17 @@ class RepositoryForm(WinForms.Form):
             WinForms.MessageBox.Show("Open failed:\n" + str(exc), "Error")
 
     def _open_record(self, section, index, record):
+        """
+        index is manifest_index -- the stable position in the JSON array.
+        After prune_stale_fields (which may save the manifest), reload
+        the record directly from the manifest using this index.
+        """
         repo.prune_stale_fields(section, index)
         data    = repo.load_manifest()
         records = data["sections"].get(section, [])
         if index < 0 or index >= len(records):
             return
-        record = records[index]
+        record = records[index]   # re-read from manifest using stable index
         target = repo.get_open_target(record)
         mode   = target["mode"]
         _log("Open mode: {0}  label={1}".format(mode, record.get("label", "")))

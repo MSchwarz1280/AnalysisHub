@@ -849,13 +849,25 @@ def _enrich_record(record):
     r["archive_path_abs"]    = arch_abs
     r["archive_date_disp"]   = record.get("archive_date", "")
     r["archive_method_disp"] = record.get("archive_method", "")
+    # NOTE: manifest_index is injected by get_section_records() after this call
     return r
 
 
 def get_section_records(section):
+    """
+    Return enriched records for a section, with manifest_index injected.
+    manifest_index is the TRUE position in the manifest JSON array and
+    must be used for all manifest mutations (remove, update, etc.).
+    It is independent of display sort order.
+    """
     data = load_manifest()
     raw  = data["sections"].get(section, [])
-    return [_enrich_record(r) for r in raw]
+    result = []
+    for i, r in enumerate(raw):
+        enriched = _enrich_record(r)
+        enriched["manifest_index"] = i   # stable manifest position
+        result.append(enriched)
+    return result
 
 
 def get_all_records():
