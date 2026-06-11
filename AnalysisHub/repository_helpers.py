@@ -2,25 +2,32 @@
 """
 repository_helpers.py  —  AnalysisHub Backend
 ==============================================
-Handles all manifest I/O, file-record management, status checks,
-health reporting, revision tracking, and archive operations.
-
 Compatible: IronPython 2.7 (ANSYS ACT / Workbench 2024 R2+)
-No external dependencies beyond Python stdlib + .NET (System).
 
-v7 additions
-------------
-* zip_extract_to(zip_path, dest_dir)  — extract a ZIP to a chosen directory
-* update_local_extract(section, index, wbpj_path)  — save extraction path
-* prune_stale_extract(section, index)  — remove stale local_extract_path
-* get_open_target(record)  — resolve what to open for a given record
+v8 changes
+----------
+* Relative archive_path storage — archive_path stored relative to repo root,
+  resolved to absolute at runtime.  Backward-compatible with existing absolute
+  paths in older manifests.
+* Archive method tag in status strings: [ZIP] / [Copy]
+* New status ARCH_STATUS_UNARCHIVED — "Unarchived — Archive when ready"
+  shown when source_path was designated from an extraction but has no archive.
+* copy_wbpj_with_files_delta — delta copy that only updates changed files,
+  skipping unchanged files by mtime comparison. Optionally exclude results.
+* copy_wbpj_with_files updated — now accepts include_results parameter.
+* Orphaned archive files scan — scan section archive folders and find files
+  not referenced by any manifest record.
+* remove_file_record updated — returns archive_path so caller can offer
+  deletion of the physical archive file.
+* zip_extract_to — extracts flat into dest_dir (not into a subfolder).
+* update_local_extract, update_source_path, prune_stale_fields,
+  get_open_target — carried forward from v7.
 """
 
 import os
 import json
 import copy
 import shutil
-import traceback
 from datetime import datetime
 
 import System
@@ -55,11 +62,13 @@ SECTION_LABELS = {
     "analysis_reports":         "Analysis Reports",
 }
 
-# Archive status strings
-ARCH_STATUS_NONE     = "Ready"
-ARCH_STATUS_OK       = u"Archived \u2714"
-ARCH_STATUS_OUTDATED = u"Archived \u2718 \u2014 Source Changed"
-ARCH_STATUS_MISSING  = "MISSING"
+# ── Archive status strings ───────────────────────────────────────────────────
+# Method tags appended at runtime: [ZIP] or [Copy]
+ARCH_STATUS_NONE       = "Ready"
+ARCH_STATUS_OK         = u"Archived \u2714"
+ARCH_STATUS_OUTDATED   = u"Archived \u2718 \u2014 Source Changed"
+ARCH_STATUS_MISSING    = "MISSING"
+ARCH_STATUS_UNARCHIVED = u"Unarchived \u2014 Archive when ready"
 
 DEFAULT_MANIFEST = {
     "schema_version": 2,
@@ -69,13 +78,7 @@ DEFAULT_MANIFEST = {
         "created": "", "modified": "",
     },
     "revision_log": [],
-    "sections": {
-        "main_wb_database":         [],
-        "supplemental_wb_database": [],
-        "customer_provided_data":   [],
-        "analysis_results":         [],
-        "analysis_reports":         [],
-    },
+    "sections": {sec: [] for sec in ALL_SECTIONS},
 }
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -84,7 +87,7 @@ DEFAULT_MANIFEST = {
 
 try:
     with open(LOG_PATH, "a") as _fh:
-        _fh.write("[{0}] REPO_HELPERS >>> Module loaded / reloaded\n".format(
+        _fh.write("[{0}] REPO_HELPERS >>> Module loaded\n".format(
             datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
 except Exception:
     pass
@@ -92,15 +95,15 @@ except Exception:
 
 def _safe_log(msg):
     try:
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with open(LOG_PATH, "a") as fh:
-            fh.write("[{0}] REPO_HELPERS >>> {1}\n".format(ts, msg))
+            fh.write("[{0}] REPO_HELPERS >>> {1}\n".format(
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg))
     except Exception:
         pass
 
 
 # ────────────────────────────────────────────────────────────────────────────
-#  Base-directory / repo-root management
+#  Base-directory / repo-root  (cached)
 # ────────────────────────────────────────────────────────────────────────────
 
 _BASE_DIR  = None
@@ -126,40 +129,70 @@ def get_repo_root():
     global _REPO_ROOT
     if _REPO_ROOT is not None:
         return _REPO_ROOT
-
     base = get_base_directory()
     _safe_log("get_repo_root resolving from: " + base)
-
     if os.path.basename(base).lower() == "user_files":
         _REPO_ROOT = os.path.join(base, "AnalysisRepository")
-        _safe_log("Resolved repo root (user_files direct): " + _REPO_ROOT)
+        _safe_log("Resolved (user_files direct): " + _REPO_ROOT)
         return _REPO_ROOT
-
     current = base
     for _ in range(10):
         if current.lower().endswith("_files"):
             _REPO_ROOT = os.path.join(current, "user_files", "AnalysisRepository")
-            _safe_log("Resolved repo root (via _files walk): " + _REPO_ROOT)
+            _safe_log("Resolved (via _files walk): " + _REPO_ROOT)
             return _REPO_ROOT
         parent = os.path.dirname(current)
         if parent == current:
             break
         current = parent
-
     sibling = os.path.join(base, os.path.basename(base) + "_files")
     if os.path.isdir(sibling):
         _REPO_ROOT = os.path.join(sibling, "user_files", "AnalysisRepository")
-        _safe_log("Resolved repo root (via sibling _files): " + _REPO_ROOT)
+        _safe_log("Resolved (sibling _files): " + _REPO_ROOT)
         return _REPO_ROOT
-
     _REPO_ROOT = os.path.join(base, "AnalysisRepository")
-    _safe_log("Resolved repo root (fallback): " + _REPO_ROOT)
+    _safe_log("Resolved (fallback): " + _REPO_ROOT)
     return _REPO_ROOT
 
 
 def get_section_archive_dir(section):
-    folder_name = SECTION_MAP.get(section, section)
-    return os.path.join(get_repo_root(), folder_name)
+    return os.path.join(get_repo_root(), SECTION_MAP.get(section, section))
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  Relative path helpers  (core of the cross-machine fix)
+# ────────────────────────────────────────────────────────────────────────────
+
+def _to_relative_archive_path(abs_path):
+    """
+    Convert an absolute archive_path to a path relative to repo_root.
+    e.g.  .../AnalysisRepository/SupplementalWBDatabase/foo.zip
+          ->  SupplementalWBDatabase/foo.zip
+    Only converts paths that are inside the repo root.
+    """
+    try:
+        repo = get_repo_root()
+        abs_norm  = os.path.normcase(os.path.abspath(abs_path))
+        repo_norm = os.path.normcase(os.path.abspath(repo))
+        if abs_norm.startswith(repo_norm + os.sep) or abs_norm == repo_norm:
+            return os.path.relpath(abs_path, repo)
+    except Exception:
+        pass
+    return abs_path   # return unchanged if outside repo or error
+
+
+def _resolve_archive_path(stored_path):
+    """
+    Resolve a stored archive_path to an absolute path on this machine.
+    Handles both:
+      - Relative paths (new format): join with get_repo_root()
+      - Absolute paths (old format): return as-is (backward compat)
+    """
+    if not stored_path:
+        return ""
+    if os.path.isabs(stored_path):
+        return stored_path          # old absolute path — use as-is
+    return os.path.join(get_repo_root(), stored_path)
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -181,7 +214,7 @@ def _ensure_repo_dirs():
         blank = copy.deepcopy(DEFAULT_MANIFEST)
         blank["project_info"]["created"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         _write_json(mpath, blank)
-        _safe_log("Created new manifest at: " + mpath)
+        _safe_log("Created manifest: " + mpath)
 
 
 def _read_json(path):
@@ -226,34 +259,71 @@ def _migrate_manifest_v1_to_v2(old):
 #  Archive status
 # ────────────────────────────────────────────────────────────────────────────
 
+def _method_tag(method):
+    """Return a short display tag for the archive method."""
+    if method == "zip":
+        return " [ZIP]"
+    elif method in ("copy_with_files", "copy"):
+        return " [Copy]"
+    return ""
+
+
 def get_archive_status(record):
     """
-    Return archive status for a record.
-    For .wbpj records uses full _files tree mtime for out-of-date detection.
+    Return the archive status string for a record, including method tag.
+
+    Status strings:
+        "Ready"                              — no source, no archive
+        "Unarchived — Archive when ready"    — has source (extracted), no archive
+        "MISSING"                            — source gone, no archive
+        "Archived ✔ [ZIP]"                  — archived and current
+        "Archived ✔ [Copy]"
+        "Archived ✘ — Source Changed [ZIP]" — archived but stale
+        "Archived ✘ — Source Changed [Copy]"
     """
     src_path = record.get("source_path", "")
+    method   = record.get("archive_method", "")
+    tag      = _method_tag(method)
 
-    if not src_path or not os.path.exists(src_path):
+    # Resolve archive path (handles both relative and absolute)
+    raw_arch = record.get("archive_path", "")
+    arch_abs = _resolve_archive_path(raw_arch)
+    has_arch = bool(arch_abs) and os.path.exists(arch_abs)
+
+    src_exists = bool(src_path) and os.path.exists(src_path)
+
+    if not src_exists and not has_arch:
         return ARCH_STATUS_MISSING
 
-    archive_path = record.get("archive_path", "")
-    if not archive_path or not os.path.exists(archive_path):
+    if not src_exists and has_arch:
+        # Source gone but archive exists — OK for recipient machines
+        return ARCH_STATUS_OK + tag
+
+    # Source exists
+    if not has_arch:
+        # Check if this was previously designated as working source
+        if record.get("_was_extracted_source"):
+            return ARCH_STATUS_UNARCHIVED
         return ARCH_STATUS_NONE
 
+    # Both source and archive exist — check if in sync
     try:
-        ext    = os.path.splitext(src_path)[1].lower()
-        method = record.get("archive_method", "copy")
+        ext = os.path.splitext(src_path)[1].lower()
         if ext == ".wbpj" and method in ("copy_with_files", "zip", "wbpz"):
             current_mtime = get_wbpj_latest_mtime(src_path)
         else:
             current_mtime = os.path.getmtime(src_path)
         if abs(current_mtime - record.get("archive_src_mtime", 0)) > 2:
-            return ARCH_STATUS_OUTDATED
+            return ARCH_STATUS_OUTDATED + tag
     except Exception:
-        return ARCH_STATUS_OUTDATED
+        return ARCH_STATUS_OUTDATED + tag
 
-    return ARCH_STATUS_OK
+    return ARCH_STATUS_OK + tag
 
+
+# ────────────────────────────────────────────────────────────────────────────
+#  Size / mtime helpers
+# ────────────────────────────────────────────────────────────────────────────
 
 def get_folder_size(folder_path):
     total = 0
@@ -293,7 +363,7 @@ def get_wbpj_files_size(wbpj_path):
 
 
 def get_wbpj_latest_mtime(wbpj_path):
-    """Max mtime across .wbpj file and entire _files folder tree."""
+    """Max mtime across .wbpj and entire _files tree."""
     latest = 0.0
     try:
         if os.path.exists(wbpj_path):
@@ -306,9 +376,9 @@ def get_wbpj_latest_mtime(wbpj_path):
             for root, dirs, files in os.walk(files_dir):
                 for f in files:
                     try:
-                        mtime = os.path.getmtime(os.path.join(root, f))
-                        if mtime > latest:
-                            latest = mtime
+                        t = os.path.getmtime(os.path.join(root, f))
+                        if t > latest:
+                            latest = t
                     except Exception:
                         pass
         except Exception:
@@ -322,31 +392,13 @@ def get_wbpj_latest_mtime(wbpj_path):
 
 def archive_regular_file(src_path, dest_dir):
     if not os.path.exists(src_path):
-        raise IOError("Source file not found: " + src_path)
+        raise IOError("Source not found: " + src_path)
     if not os.path.exists(dest_dir):
         os.makedirs(dest_dir)
     dest_path = os.path.join(dest_dir, os.path.basename(src_path))
     shutil.copy2(src_path, dest_path)
-    _safe_log("Archived regular file: {0} -> {1}".format(src_path, dest_path))
+    _safe_log("Archived file: {0} -> {1}".format(src_path, dest_path))
     return dest_path
-
-
-def copy_wbpj_with_files(wbpj_path, dest_dir):
-    if not os.path.exists(wbpj_path):
-        raise IOError("Source .wbpj not found: " + wbpj_path)
-    if not os.path.exists(dest_dir):
-        os.makedirs(dest_dir)
-    dest_wbpj = os.path.join(dest_dir, os.path.basename(wbpj_path))
-    shutil.copy2(wbpj_path, dest_wbpj)
-    _safe_log("Copied .wbpj: {0} -> {1}".format(wbpj_path, dest_wbpj))
-    files_dir  = os.path.splitext(wbpj_path)[0] + "_files"
-    if os.path.isdir(files_dir):
-        dest_files = os.path.join(dest_dir, os.path.basename(files_dir))
-        if os.path.exists(dest_files):
-            shutil.rmtree(dest_files)
-        shutil.copytree(files_dir, dest_files)
-        _safe_log("Copied _files: {0} -> {1}".format(files_dir, dest_files))
-    return dest_wbpj
 
 
 _RESULT_FILE_EXTENSIONS = {
@@ -355,24 +407,130 @@ _RESULT_FILE_EXTENSIONS = {
     ".db", ".out", ".err",
     ".DSP", ".full", ".sub",
     ".mntr", ".stat",
-    ".cas", ".dat.gz",
-    ".cff", ".res", ".trn",
+    ".cas", ".cff", ".res", ".trn",
 }
 
 
 def _is_result_file(rel_path):
     parts = rel_path.replace("/", "\\").split("\\")
     ext   = os.path.splitext(rel_path)[1].lower()
-    if len(parts) >= 2:
-        if parts[-2].upper() == "MECH" and ext in _RESULT_FILE_EXTENSIONS:
+    if len(parts) >= 2 and parts[-2].upper() == "MECH":
+        if ext in _RESULT_FILE_EXTENSIONS:
             return True
     return False
+
+
+def copy_wbpj_with_files(wbpj_path, dest_dir, include_results=False,
+                          progress_callback=None):
+    """
+    Copy a .wbpj and its _files folder into dest_dir (flat, no subfolder).
+    Supports optional result file exclusion.
+    Returns the destination .wbpj path.
+    """
+    if not os.path.exists(wbpj_path):
+        raise IOError("Source .wbpj not found: " + wbpj_path)
+    if not os.path.exists(dest_dir):
+        os.makedirs(dest_dir)
+
+    dest_wbpj = os.path.join(dest_dir, os.path.basename(wbpj_path))
+    shutil.copy2(wbpj_path, dest_wbpj)
+    _safe_log("Copied .wbpj: " + dest_wbpj)
+    if progress_callback:
+        progress_callback(os.path.basename(wbpj_path))
+
+    base      = os.path.splitext(wbpj_path)[0]
+    files_dir = base + "_files"
+    if os.path.isdir(files_dir):
+        dest_files = os.path.join(dest_dir, os.path.basename(files_dir))
+        if not os.path.exists(dest_files):
+            os.makedirs(dest_files)
+        for root, dirs, files in os.walk(files_dir):
+            dirs.sort()
+            files.sort()
+            rel_root = os.path.relpath(root, files_dir)
+            dest_root = os.path.join(dest_files, rel_root)
+            if not os.path.exists(dest_root):
+                os.makedirs(dest_root)
+            for fname in files:
+                src_file  = os.path.join(root, fname)
+                # Build rel_path for result-file check
+                rel_path  = os.path.join(
+                    os.path.basename(files_dir), rel_root, fname)
+                if not include_results and _is_result_file(rel_path):
+                    continue
+                dest_file = os.path.join(dest_root, fname)
+                shutil.copy2(src_file, dest_file)
+                if progress_callback:
+                    progress_callback(fname)
+        _safe_log("Copied _files: " + dest_files)
+
+    return dest_wbpj
+
+
+def copy_wbpj_with_files_delta(wbpj_path, dest_dir, include_results=False,
+                                progress_callback=None):
+    """
+    Delta copy — only copies files newer than existing destination copies.
+    Uses mtime comparison with a 2-second tolerance.
+    Falls back to full copy for files that don't exist in dest.
+    Returns the destination .wbpj path.
+    """
+    if not os.path.exists(wbpj_path):
+        raise IOError("Source .wbpj not found: " + wbpj_path)
+    if not os.path.exists(dest_dir):
+        os.makedirs(dest_dir)
+
+    copied = skipped = 0
+
+    # Copy .wbpj itself
+    dest_wbpj = os.path.join(dest_dir, os.path.basename(wbpj_path))
+    src_mtime = os.path.getmtime(wbpj_path)
+    if (not os.path.exists(dest_wbpj) or
+            abs(os.path.getmtime(dest_wbpj) - src_mtime) > 2):
+        shutil.copy2(wbpj_path, dest_wbpj)
+        copied += 1
+    else:
+        skipped += 1
+    if progress_callback:
+        progress_callback(os.path.basename(wbpj_path))
+
+    base      = os.path.splitext(wbpj_path)[0]
+    files_dir = base + "_files"
+    if os.path.isdir(files_dir):
+        dest_files = os.path.join(dest_dir, os.path.basename(files_dir))
+        for root, dirs, files in os.walk(files_dir):
+            dirs.sort()
+            files.sort()
+            rel_root  = os.path.relpath(root, files_dir)
+            dest_root = os.path.join(dest_files, rel_root)
+            if not os.path.exists(dest_root):
+                os.makedirs(dest_root)
+            for fname in files:
+                src_file  = os.path.join(root, fname)
+                rel_path  = os.path.join(
+                    os.path.basename(files_dir), rel_root, fname)
+                if not include_results and _is_result_file(rel_path):
+                    continue
+                dest_file  = os.path.join(dest_root, fname)
+                src_mtime2 = os.path.getmtime(src_file)
+                if (not os.path.exists(dest_file) or
+                        abs(os.path.getmtime(dest_file) - src_mtime2) > 2):
+                    shutil.copy2(src_file, dest_file)
+                    copied += 1
+                    if progress_callback:
+                        progress_callback(fname)
+                else:
+                    skipped += 1
+
+    _safe_log("Delta copy complete: {0} copied, {1} unchanged".format(
+        copied, skipped))
+    return dest_wbpj
 
 
 def zip_wbpj_with_files(wbpj_path, dest_dir, include_results=False,
                          progress_callback=None):
     """
-    Create a ZIP archive of a .wbpj + _files folder.
+    Create a ZIP archive of a .wbpj + _files folder in dest_dir.
     Returns the path of the created .zip file.
     """
     import zipfile
@@ -387,8 +545,18 @@ def zip_wbpj_with_files(wbpj_path, dest_dir, include_results=False,
     base_dir     = os.path.dirname(wbpj_path)
     files_dir    = os.path.join(base_dir, project_name + "_files")
 
-    _safe_log("Creating ZIP: " + zip_path)
-    _safe_log("include_results={0}".format(include_results))
+    # Count total files first so progress bar can be deterministic
+    total_files = 1  # the .wbpj itself
+    if os.path.isdir(files_dir):
+        for root, dirs, files in os.walk(files_dir):
+            for fname in files:
+                full = os.path.join(root, fname)
+                rel  = os.path.relpath(full, base_dir)
+                if include_results or not _is_result_file(rel):
+                    total_files += 1
+
+    _safe_log("Creating ZIP: {0}  ({1} files, include_results={2})".format(
+        zip_path, total_files, include_results))
 
     file_count = skip_count = 0
 
@@ -398,7 +566,7 @@ def zip_wbpj_with_files(wbpj_path, dest_dir, include_results=False,
         zf.write(wbpj_path, arcname)
         file_count += 1
         if progress_callback:
-            progress_callback(arcname)
+            progress_callback(arcname, file_count, total_files)
 
         if os.path.isdir(files_dir):
             for root, dirs, files in os.walk(files_dir):
@@ -414,50 +582,57 @@ def zip_wbpj_with_files(wbpj_path, dest_dir, include_results=False,
                         zf.write(full_path, arcname)
                         file_count += 1
                         if progress_callback:
-                            progress_callback(fname)
+                            progress_callback(fname, file_count, total_files)
                     except Exception as exc:
                         _safe_log("ZIP skip {0}: {1}".format(full_path, str(exc)))
 
-    _safe_log("ZIP complete: {0} added, {1} skipped".format(file_count, skip_count))
+    _safe_log("ZIP complete: {0} added, {1} skipped".format(
+        file_count, skip_count))
     return zip_path
 
 
 def zip_extract_to(zip_path, dest_dir, progress_callback=None):
     """
-    Extract a .zip archive to dest_dir.
-    Creates dest_dir if it does not exist.
-    Returns the path to the extracted .wbpj file (if found), else dest_dir.
+    Extract a .zip archive FLAT into dest_dir (no subfolder created).
+    The .wbpj and _files folder land directly inside dest_dir.
+    Returns the path to the extracted .wbpj if found, else dest_dir.
     """
     import zipfile
 
     if not os.path.exists(zip_path):
         raise IOError("ZIP not found: " + zip_path)
-
     if not os.path.exists(dest_dir):
         os.makedirs(dest_dir)
 
-    _safe_log("Extracting ZIP: {0} -> {1}".format(zip_path, dest_dir))
+    _safe_log("Extracting ZIP flat: {0} -> {1}".format(zip_path, dest_dir))
 
     with zipfile.ZipFile(zip_path, "r") as zf:
         names = zf.namelist()
-        for name in names:
+        total = len(names)
+        for i, name in enumerate(names):
             if progress_callback:
-                progress_callback(os.path.basename(name))
+                progress_callback(os.path.basename(name), i + 1, total)
             zf.extract(name, dest_dir)
 
-    # Find the extracted .wbpj
+    # Find extracted .wbpj at root level of dest_dir
     for name in names:
         if name.lower().endswith(".wbpj") and "/" not in name and "\\" not in name:
             wbpj_path = os.path.join(dest_dir, name)
             _safe_log("Extracted .wbpj: " + wbpj_path)
             return wbpj_path
 
-    _safe_log("Extraction complete (no .wbpj found at root): " + dest_dir)
+    _safe_log("Extraction complete — no root .wbpj found in: " + dest_dir)
     return dest_dir
 
 
+# ────────────────────────────────────────────────────────────────────────────
+#  Manifest record update helpers
+# ────────────────────────────────────────────────────────────────────────────
+
 def update_archive_record(section, index, archive_path, method):
-    """Write archive metadata into manifest. Handles full _files mtime for .wbpj."""
+    """
+    Write archive metadata into manifest. Stores archive_path as relative.
+    """
     data    = load_manifest()
     records = data["sections"].get(section, [])
     if index < 0 or index >= len(records):
@@ -482,45 +657,49 @@ def update_archive_record(section, index, archive_path, method):
     except Exception:
         src_size = 0
 
-    records[index]["archive_path"]      = archive_path
+    # Store as RELATIVE path so it works on any machine
+    rel_path = _to_relative_archive_path(archive_path)
+
+    records[index]["archive_path"]      = rel_path
     records[index]["archive_date"]      = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     records[index]["archive_src_mtime"] = src_mtime
     records[index]["archive_src_size"]  = src_size
     records[index]["archive_method"]    = method
+    # Clear _was_extracted_source flag if present
+    records[index].pop("_was_extracted_source", None)
 
     save_manifest(data)
-    _safe_log("Archive record updated [{0}][{1}]: {2}  (mtime={3})".format(
-        section, index, archive_path, int(src_mtime)))
+    _safe_log("Archive record updated [{0}][{1}]: {2} -> rel={3}".format(
+        section, index, archive_path, rel_path))
     return True
 
 
 def update_local_extract(section, index, extracted_wbpj_path):
-    """
-    Save the local extraction path for a ZIP-archived .wbpj record.
-    Also optionally updates source_path if the user designates the
-    extracted copy as the new working version.
-    """
+    """Save local extraction path for a ZIP-archived record."""
     data    = load_manifest()
     records = data["sections"].get(section, [])
     if index < 0 or index >= len(records):
-        _safe_log("update_local_extract: index out of range")
         return False
     records[index]["local_extract_path"] = extracted_wbpj_path
     records[index]["local_extract_date"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     save_manifest(data)
-    _safe_log("Local extract path saved [{0}][{1}]: {2}".format(
+    _safe_log("Local extract saved [{0}][{1}]: {2}".format(
         section, index, extracted_wbpj_path))
     return True
 
 
 def update_source_path(section, index, new_source_path):
-    """Update source_path — called when user designates extracted copy as working source."""
+    """
+    Update source_path to the extracted copy.
+    Clears archive record (source changed) and marks _was_extracted_source
+    so get_archive_status shows ARCH_STATUS_UNARCHIVED instead of NONE.
+    """
     data    = load_manifest()
     records = data["sections"].get(section, [])
     if index < 0 or index >= len(records):
         return False
-    records[index]["source_path"] = new_source_path
-    # Clear archive record — source has changed, archive is now stale
+    records[index]["source_path"]         = new_source_path
+    records[index]["_was_extracted_source"] = True
     for key in ["archive_path", "archive_date", "archive_src_mtime",
                 "archive_src_size", "archive_method"]:
         records[index].pop(key, None)
@@ -532,9 +711,8 @@ def update_source_path(section, index, new_source_path):
 
 def prune_stale_fields(section, index):
     """
-    Check source_path and local_extract_path on the current machine.
-    Remove any that don't exist on disk (they belonged to another machine).
-    Returns a dict of what was pruned.
+    Remove source_path and local_extract_path if they don't exist on this machine.
+    Returns dict of what was pruned.
     """
     data    = load_manifest()
     records = data["sections"].get(section, [])
@@ -550,8 +728,7 @@ def prune_stale_fields(section, index):
         pruned["source_path"] = src
         records[index].pop("source_path", None)
         changed = True
-        _safe_log("Pruned stale source_path [{0}][{1}]: {2}".format(
-            section, index, src))
+        _safe_log("Pruned stale source_path [{0}][{1}]".format(section, index))
 
     ext_path = record.get("local_extract_path", "")
     if ext_path and not os.path.exists(ext_path):
@@ -559,34 +736,22 @@ def prune_stale_fields(section, index):
         records[index].pop("local_extract_path", None)
         records[index].pop("local_extract_date", None)
         changed = True
-        _safe_log("Pruned stale local_extract_path [{0}][{1}]: {2}".format(
-            section, index, ext_path))
+        _safe_log("Pruned stale local_extract_path [{0}][{1}]".format(
+            section, index))
 
     if changed:
         save_manifest(data)
-
     return pruned
 
 
 def get_open_target(record):
     """
     Analyse a record and return a dict describing how it should be opened.
-
-    Returns:
-    {
-        "mode":         "source" | "archive_zip" | "archive_direct" | "extract_first" | "none"
-        "source_path":  str or ""   — original reference path (if accessible)
-        "archive_path": str or ""   — archive copy path (if exists)
-        "extract_path": str or ""   — local extracted .wbpj path (if exists)
-        "has_source":   bool
-        "has_archive":  bool
-        "has_extract":  bool
-        "method":       archive method string
-        "is_zip":       bool
-    }
+    Resolves relative archive_path to absolute before checking existence.
     """
     src      = record.get("source_path", "")
-    arch     = record.get("archive_path", "")
+    raw_arch = record.get("archive_path", "")
+    arch     = _resolve_archive_path(raw_arch)
     ext_path = record.get("local_extract_path", "")
     method   = record.get("archive_method", "")
     is_zip   = (method == "zip")
@@ -596,19 +761,13 @@ def get_open_target(record):
     has_extract = bool(ext_path) and os.path.exists(ext_path)
 
     if is_zip and has_archive:
-        if has_extract:
-            mode = "archive_zip"      # show "open existing / re-extract / different location"
-        else:
-            mode = "extract_first"    # prompt for extraction location
+        mode = "archive_zip" if has_extract else "extract_first"
     elif has_archive and not is_zip:
-        if has_source:
-            mode = "archive_direct"   # show "open source / open archive copy" choice
-        else:
-            mode = "archive_direct"   # only archive available — open it directly
+        mode = "archive_direct"
     elif has_source:
-        mode = "source"               # no archive — open source directly
+        mode = "source"
     else:
-        mode = "none"                 # nothing accessible
+        mode = "none"
 
     return {
         "mode":         mode,
@@ -630,7 +789,8 @@ def clear_archive_record(section, index):
         return False
     for key in ["archive_path", "archive_date", "archive_src_mtime",
                 "archive_src_size", "archive_method",
-                "local_extract_path", "local_extract_date"]:
+                "local_extract_path", "local_extract_date",
+                "_was_extracted_source"]:
         records[index].pop(key, None)
     save_manifest(data)
     _safe_log("Archive record cleared [{0}][{1}]".format(section, index))
@@ -645,15 +805,19 @@ def _enrich_record(record):
     r    = dict(record)
     path = r.get("source_path", "")
 
+    # Resolve archive path for existence checks
+    arch_abs = _resolve_archive_path(r.get("archive_path", ""))
+
     if not path or not os.path.exists(path):
-        # Check if an archive copy exists to determine status
-        arch = r.get("archive_path", "")
-        if arch and os.path.exists(arch):
-            r["status"] = ARCH_STATUS_OK   # source gone but archive present
+        if arch_abs and os.path.exists(arch_abs):
+            # Source gone but archive present — show as Archived OK
+            r["status"]   = get_archive_status(record)
+            r["size_mb"]  = u"\u2014"
+            r["modified"] = u"\u2014"
         else:
-            r["status"] = ARCH_STATUS_MISSING
-        r["size_mb"]  = u"\u2014"
-        r["modified"] = u"\u2014"
+            r["status"]   = ARCH_STATUS_MISSING
+            r["size_mb"]  = u"\u2014"
+            r["modified"] = u"\u2014"
     else:
         r["status"] = get_archive_status(record)
         try:
@@ -667,6 +831,8 @@ def _enrich_record(record):
         except Exception:
             r["modified"] = u"\u2014"
 
+    # Expose resolved archive path for UI use
+    r["archive_path_abs"] = arch_abs
     return r
 
 
@@ -702,6 +868,11 @@ def add_file_record(section, path, label=None, notes=""):
 
 
 def remove_file_record(section, index):
+    """
+    Remove a manifest record.
+    Returns the removed record dict (contains archive_path if archived)
+    so the caller can offer to delete the physical archive file.
+    """
     data    = load_manifest()
     records = data["sections"].get(section, [])
     if 0 <= index < len(records):
@@ -713,6 +884,37 @@ def remove_file_record(section, index):
         return removed
     _safe_log("Remove failed: index out of range")
     return None
+
+
+def delete_archive_file(record):
+    """
+    Delete the physical archive file (and folder for copy_with_files).
+    Called after the user confirms deletion following remove_file_record.
+    Returns True if deleted successfully.
+    """
+    raw_arch = record.get("archive_path", "")
+    arch_abs = _resolve_archive_path(raw_arch)
+    method   = record.get("archive_method", "")
+
+    if not arch_abs or not os.path.exists(arch_abs):
+        _safe_log("delete_archive_file: nothing to delete at " + str(arch_abs))
+        return False
+
+    try:
+        os.remove(arch_abs)
+        _safe_log("Deleted archive file: " + arch_abs)
+
+        # For copy_with_files, also delete the _files folder
+        if method == "copy_with_files":
+            base      = os.path.splitext(arch_abs)[0]
+            files_dir = base + "_files"
+            if os.path.isdir(files_dir):
+                shutil.rmtree(files_dir)
+                _safe_log("Deleted _files folder: " + files_dir)
+        return True
+    except Exception as exc:
+        _safe_log("delete_archive_file error: " + str(exc))
+        return False
 
 
 def update_file_notes(section, index, notes):
@@ -736,13 +938,13 @@ def relink_file_record(section, index, new_path):
         records[index]["source_path"] = new_path
         for key in ["archive_path", "archive_date", "archive_src_mtime",
                     "archive_src_size", "archive_method",
-                    "local_extract_path", "local_extract_date"]:
+                    "local_extract_path", "local_extract_date",
+                    "_was_extracted_source"]:
             records[index].pop(key, None)
         save_manifest(data)
         _safe_log("Relinked [{0}][{1}]: {2} -> {3}".format(
             section, index, old_path, new_path))
         return True
-    _safe_log("Relink failed: index out of range")
     return False
 
 
@@ -788,14 +990,64 @@ def get_revision_log():
 
 
 # ────────────────────────────────────────────────────────────────────────────
-#  Health check / statistics
+#  Health check  (with orphaned archive file scan)
 # ────────────────────────────────────────────────────────────────────────────
 
+def scan_orphaned_archive_files():
+    """
+    Scan all section archive folders and find files that have no matching
+    manifest record.  Returns a list of dicts:
+      { "path": absolute_path, "section": section_id, "filename": str }
+    """
+    data     = load_manifest()
+    orphans  = []
+
+    for sec in ALL_SECTIONS:
+        arch_dir = get_section_archive_dir(sec)
+        if not os.path.isdir(arch_dir):
+            continue
+
+        # Collect all archive paths referenced by this section's records
+        referenced = set()
+        for r in data["sections"].get(sec, []):
+            raw  = r.get("archive_path", "")
+            abs_ = _resolve_archive_path(raw)
+            if abs_:
+                referenced.add(os.path.normcase(os.path.abspath(abs_)))
+            # Also track _files folder for copy_with_files
+            if r.get("archive_method") == "copy_with_files" and abs_:
+                files_folder = os.path.splitext(abs_)[0] + "_files"
+                referenced.add(os.path.normcase(os.path.abspath(files_folder)))
+
+        # Walk the archive directory (one level only — no deep nesting)
+        for entry in os.listdir(arch_dir):
+            full = os.path.join(arch_dir, entry)
+            norm = os.path.normcase(os.path.abspath(full))
+            if norm not in referenced:
+                orphans.append({
+                    "path":     full,
+                    "section":  sec,
+                    "filename": entry,
+                    "is_dir":   os.path.isdir(full),
+                })
+
+    _safe_log("Orphan scan: {0} orphaned items found".format(len(orphans)))
+    return orphans
+
+
 def run_health_check():
+    """
+    Full health check including orphaned archive file scan.
+    """
     result = {
-        "total": 0, "ready": 0, "missing": 0,
-        "archived_ok": 0, "archived_old": 0,
-        "missing_list": [], "sections": {},
+        "total":        0,
+        "ready":        0,
+        "missing":      0,
+        "archived_ok":  0,
+        "archived_old": 0,
+        "missing_list": [],
+        "orphaned":     [],
+        "sections":     {},
     }
     data = load_manifest()
     for sec in ALL_SECTIONS:
@@ -804,21 +1056,19 @@ def run_health_check():
         sec_missing = 0
         for r in records:
             status = get_archive_status(r)
-            if status == ARCH_STATUS_MISSING:
-                # Only count as missing if no archive copy either
-                arch = r.get("archive_path", "")
-                if not arch or not os.path.exists(arch):
-                    sec_missing += 1
-                    result["missing_list"].append({
-                        "label":   r.get("label", "Unnamed"),
-                        "path":    r.get("source_path", ""),
-                        "section": SECTION_LABELS.get(sec, sec),
-                    })
-                else:
-                    result["archived_ok"] += 1
-            elif status == ARCH_STATUS_OK:
+            arch_abs = _resolve_archive_path(r.get("archive_path", ""))
+            has_arch = bool(arch_abs) and os.path.exists(arch_abs)
+
+            if status == ARCH_STATUS_MISSING and not has_arch:
+                sec_missing += 1
+                result["missing_list"].append({
+                    "label":   r.get("label", "Unnamed"),
+                    "path":    r.get("source_path", ""),
+                    "section": SECTION_LABELS.get(sec, sec),
+                })
+            if ARCH_STATUS_OK in status:
                 result["archived_ok"] += 1
-            elif status == ARCH_STATUS_OUTDATED:
+            elif ARCH_STATUS_OUTDATED in status:
                 result["archived_old"] += 1
 
         result["sections"][sec] = {"total": sec_total, "missing": sec_missing}
@@ -826,10 +1076,13 @@ def run_health_check():
         result["missing"] += sec_missing
         result["ready"]   += (sec_total - sec_missing)
 
-    _safe_log("Health check: {0} total, {1} missing, {2} archived OK, "
-              "{3} archived outdated".format(
+    result["orphaned"] = scan_orphaned_archive_files()
+
+    _safe_log("Health check: {0} total, {1} missing, "
+              "{2} archived OK, {3} outdated, {4} orphans".format(
                   result["total"], result["missing"],
-                  result["archived_ok"], result["archived_old"]))
+                  result["archived_ok"], result["archived_old"],
+                  len(result["orphaned"])))
     return result
 
 
@@ -845,7 +1098,6 @@ def get_summary_stats():
 def get_archive_candidates(open_project_path=None):
     open_norm = (os.path.normcase(os.path.abspath(open_project_path))
                  if open_project_path else None)
-
     data       = load_manifest()
     candidates = []
 
@@ -864,7 +1116,6 @@ def get_archive_candidates(open_project_path=None):
 
             ext     = os.path.splitext(src)[1].lower()
             is_wbpj = (ext == ".wbpj")
-
             src_size = 0
             try:
                 if os.path.exists(src):
@@ -887,7 +1138,8 @@ def get_archive_candidates(open_project_path=None):
                 "source_size_str":       format_size(src_size),
                 "wbpj_total_size_bytes": wbpj_total,
                 "wbpj_total_size_str":   format_size(wbpj_total),
-                "archive_path":          r.get("archive_path", ""),
+                "archive_path":          _resolve_archive_path(
+                    r.get("archive_path", "")),
                 "archive_date":          r.get("archive_date", ""),
                 "archive_method":        r.get("archive_method", ""),
             })
@@ -896,12 +1148,11 @@ def get_archive_candidates(open_project_path=None):
 
 
 # ────────────────────────────────────────────────────────────────────────────
-#  WBPZ batch script (kept for future Guided ARCHIVE use)
+#  WBPZ script (kept for Guided ARCHIVE future use)
 # ────────────────────────────────────────────────────────────────────────────
 
 def generate_wbpz_script(wbpj_path, dest_dir,
-                         include_results=False,
-                         include_external=True,
+                         include_results=False, include_external=True,
                          archive_notes="Archived via AnalysisHub"):
     import re
     if not os.path.exists(dest_dir):
@@ -911,20 +1162,19 @@ def generate_wbpz_script(wbpj_path, dest_dir,
     script_path  = r"C:\Temp\AnalysisHub_archive_{0}.py".format(safe_name)
     marker_path  = r"C:\Temp\AnalysisHub_archive_{0}.done".format(safe_name)
     wbpz_path    = os.path.join(dest_dir, project_name + ".wbpz")
-
     lines = [
         "import os",
-        "wbpj_path   = r\"{0}\"".format(wbpj_path),
-        "wbpz_path   = r\"{0}\"".format(wbpz_path),
-        "marker_path = r\"{0}\"".format(marker_path),
+        "wbpj_path=r\"{0}\"".format(wbpj_path),
+        "wbpz_path=r\"{0}\"".format(wbpz_path),
+        "marker=r\"{0}\"".format(marker_path),
         "if not os.path.exists(r\"{0}\"): os.makedirs(r\"{0}\")".format(dest_dir),
         "Open(FilePath=wbpj_path)",
-        "Archive(FilePath=wbpz_path, IncludeResultsFiles={0}, "
-        "IncludeExternalFiles={1}, ArchiveNotes=r\"{2}\")".format(
+        "Archive(FilePath=wbpz_path,IncludeResultsFiles={0},"
+        "IncludeExternalFiles={1},ArchiveNotes=r\"{2}\")".format(
             "True" if include_results else "False",
             "True" if include_external else "False",
             archive_notes),
-        "open(marker_path, 'w').write('done')",
+        "open(marker,'w').write('done')",
     ]
     with open(script_path, "w") as fh:
         fh.write("\n".join(lines))
@@ -937,6 +1187,5 @@ def cleanup_archive_script(script_path):
         try:
             if os.path.exists(path):
                 os.remove(path)
-                _safe_log("Removed temp file: " + path)
-        except Exception as exc:
-            _safe_log("Could not remove: " + str(exc))
+        except Exception:
+            pass

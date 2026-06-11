@@ -1,25 +1,29 @@
 # -*- coding: utf-8 -*-
 """
-main.py  —  AnalysisHub ACT Extension  (Entry Point)
-=====================================================
+main.py  v8  -  AnalysisHub ACT Extension
+==========================================
 IronPython 2.7 / ANSYS Workbench 2024 R2+
 
-v7 — Smart Open / ZIP Extract workflow
----------------------------------------
-* Context-aware open: source vs archive vs extract
-* ZipExtractDialog: choose extraction location (beside ZIP or custom)
-* ZipOpenDialog: open existing extract / re-extract / different location
-* OpenChoiceDialog: open source vs open archive copy (non-ZIP archived files)
-* Stale path pruning: local_extract_path and source_path cleaned on open
-* Designate extracted copy as working source
-* Archive toolbar button + status-dropdown trigger
-* Sort, right-click menu, relink, tab drawing, bold headers
+v8 changes
+----------
+* Remove prompts to delete physical archive file on remove (Notes 3/4)
+* ZipOpenDialog: "Open original source file" option when source exists
+* Flat extraction into section archive dir (no subfolder)
+* Progress dialog parented to RepositoryForm, determinate with file count
+* Archive method tag in status: [ZIP] / [Copy]
+* Results exclusion checkbox for copy-with-files method
+* Health Check: Orphaned Archive Files section with Delete option
+* Right-click: Open Ref Directory / Open Repository Directory
+* "Unarchived -- Archive when ready" status
+* Delta re-archive for copy_with_files method
+* Relative archive_path -- works on any machine after WBPZ transfer
 """
 
 import os
 import sys
 import datetime
 import traceback
+import shutil
 
 import System
 import clr
@@ -39,16 +43,12 @@ except Exception:
 
 import repository_helpers as repo
 
-# ────────────────────────────────────────────────────────────────────────────
-#  Logging
-# ────────────────────────────────────────────────────────────────────────────
-
 LOG_PATH = r"C:\Temp\AnalysisHub_debug.log"
 
 try:
     with open(LOG_PATH, "w") as _fh:
         _fh.write("=" * 80 + "\n")
-        _fh.write("  AnalysisHub  -  Module loaded: {0}\n".format(
+        _fh.write("  AnalysisHub v8  -  {0}\n".format(
             datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
         _fh.write("=" * 80 + "\n")
 except Exception:
@@ -60,14 +60,10 @@ def _log(msg):
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with open(LOG_PATH, "a") as fh:
             fh.write("[{0}] MAIN >>> {1}\n".format(ts, msg))
-        print("[{0}] MAIN >>> {1}".format(ts, msg))
+        print("[{0}] {1}".format(ts, msg))
     except Exception:
         pass
 
-
-# ────────────────────────────────────────────────────────────────────────────
-#  Project-directory resolution
-# ────────────────────────────────────────────────────────────────────────────
 
 def _resolve_project_dir(task=None):
     try:
@@ -82,7 +78,6 @@ def _resolve_project_dir(task=None):
                 return user_files
     except Exception as exc:
         _log("Project.GetProjectFile() failed: " + str(exc))
-
     if task is not None:
         try:
             ad = task.ActiveDirectory
@@ -90,7 +85,6 @@ def _resolve_project_dir(task=None):
                 return ad
         except Exception:
             pass
-
     try:
         for tg in ExtAPI.DataModel.TaskGroups:
             if tg.Name == "AnalysisHubGroup":
@@ -100,7 +94,6 @@ def _resolve_project_dir(task=None):
                         return ad
     except Exception:
         pass
-
     _log("WARNING: No saved project found.")
     return None
 
@@ -119,33 +112,27 @@ def _get_runwb2_path():
     try:
         install_root = (Ansys.Utilities.ApplicationConfiguration
                         .DefaultConfiguration.AwpRootEnvironmentVariableValue)
-        platform     = (Ansys.Utilities.ApplicationConfiguration
-                        .DefaultConfiguration.Platform)
+        platform = (Ansys.Utilities.ApplicationConfiguration
+                    .DefaultConfiguration.Platform)
         runwb2 = System.IO.Path.Combine(
             install_root, "Framework", "bin", platform, "runwb2.exe")
         if System.IO.File.Exists(runwb2):
             return runwb2
-    except Exception as exc:
-        _log("_get_runwb2_path error: " + str(exc))
-    for candidate in [
-        r"C:\Program Files\ANSYS Inc\v242\Framework\bin\Win64\RunWB2.exe",
-        r"C:\Program Files\ANSYS Inc\v251\Framework\bin\Win64\RunWB2.exe",
-    ]:
-        if os.path.exists(candidate):
-            return candidate
+    except Exception:
+        pass
+    for c in [r"C:\Program Files\ANSYS Inc\v242\Framework\bin\Win64\RunWB2.exe",
+              r"C:\Program Files\ANSYS Inc\v251\Framework\bin\Win64\RunWB2.exe"]:
+        if os.path.exists(c):
+            return c
     return None
 
-
-# ────────────────────────────────────────────────────────────────────────────
-#  Smart file opener  (low-level — opens a single known path)
-# ────────────────────────────────────────────────────────────────────────────
 
 def _smart_open_file(path):
     if not path or not os.path.exists(path):
         _log("Open failed - not found: " + str(path))
         return False
     ext = os.path.splitext(path)[1].lower()
-    _log("Opening: {0}  (ext={1})".format(path, ext))
+    _log("Opening: {0}".format(path))
     try:
         if ext in (".wbpj", ".wbpz"):
             runwb2 = _get_runwb2_path()
@@ -174,17 +161,13 @@ def _smart_open_file(path):
         return False
 
 
-# ────────────────────────────────────────────────────────────────────────────
-#  UI colours / fonts / column constants
-# ────────────────────────────────────────────────────────────────────────────
-
 _CLR_ANSYS_BLUE  = Drawing.Color.FromArgb(0,   120, 212)
 _CLR_READY       = Drawing.Color.FromArgb(16,  124,  16)
 _CLR_MISSING     = Drawing.Color.FromArgb(209,  52,  56)
 _CLR_ARCHIVED_OK = Drawing.Color.FromArgb(0,   102, 204)
 _CLR_ARCHIVED_OLD= Drawing.Color.FromArgb(200, 100,   0)
+_CLR_UNARCHIVED  = Drawing.Color.FromArgb(128,   0, 128)
 _CLR_GREEN_DIM   = Drawing.Color.FromArgb(0,   128,   0)
-_CLR_WARN_BG     = Drawing.Color.FromArgb(255, 244, 206)
 
 _FONT_NORMAL = Drawing.Font("Segoe UI",  9.5)
 _FONT_BOLD   = Drawing.Font("Segoe UI",  9.5, Drawing.FontStyle.Bold)
@@ -199,12 +182,8 @@ COL_DATEADDED = 4
 COL_NOTES     = 5
 COL_FULLPATH  = 6
 
-SIZE_WARN_BYTES = 1024 * 1024 * 1024   # 1 GB
+SIZE_WARN_BYTES = 1024 * 1024 * 1024
 
-
-# ────────────────────────────────────────────────────────────────────────────
-#  Button factory
-# ────────────────────────────────────────────────────────────────────────────
 
 def _make_btn(text, x, y, w=160, h=36, primary=False, handler=None):
     btn = WinForms.Button()
@@ -226,10 +205,6 @@ def _make_btn(text, x, y, w=160, h=36, primary=False, handler=None):
     return btn
 
 
-# ────────────────────────────────────────────────────────────────────────────
-#  Notes dialog
-# ────────────────────────────────────────────────────────────────────────────
-
 class NotesDialog(WinForms.Form):
     def __init__(self, current_notes=""):
         self.result_notes  = current_notes
@@ -237,17 +212,14 @@ class NotesDialog(WinForms.Form):
         self.Width         = 480
         self.Height        = 260
         self.StartPosition = WinForms.FormStartPosition.CenterParent
-        self.MinimizeBox   = False
-        self.MaximizeBox   = False
-        self.BackColor     = Drawing.Color.White
-        self.Font          = _FONT_NORMAL
-
+        self.MinimizeBox = self.MaximizeBox = False
+        self.BackColor   = Drawing.Color.White
+        self.Font        = _FONT_NORMAL
         lbl = WinForms.Label()
         lbl.Text = "Notes / Description:"
         lbl.Location = Drawing.Point(12, 12)
         lbl.AutoSize = True
         self.Controls.Add(lbl)
-
         self._tb = WinForms.TextBox()
         self._tb.Multiline  = True
         self._tb.ScrollBars = WinForms.ScrollBars.Vertical
@@ -255,7 +227,6 @@ class NotesDialog(WinForms.Form):
         self._tb.Size       = Drawing.Size(440, 140)
         self._tb.Text       = current_notes
         self.Controls.Add(self._tb)
-
         self.Controls.Add(_make_btn("OK",     260, 185, 90, 32, primary=True,
                                     handler=self._ok))
         self.Controls.Add(_make_btn("Cancel", 360, 185, 90, 32,
@@ -271,47 +242,36 @@ class NotesDialog(WinForms.Form):
         self.Close()
 
 
-# ────────────────────────────────────────────────────────────────────────────
-#  Revision dialog
-# ────────────────────────────────────────────────────────────────────────────
-
 class RevisionDialog(WinForms.Form):
     def __init__(self, current_rev=""):
-        self.result_rev  = ""
-        self.result_note = ""
+        self.result_rev = self.result_note = ""
         self.Text          = "Add Revision Entry"
         self.Width         = 460
         self.Height        = 240
         self.StartPosition = WinForms.FormStartPosition.CenterParent
-        self.MinimizeBox   = False
-        self.MaximizeBox   = False
-        self.BackColor     = Drawing.Color.White
-        self.Font          = _FONT_NORMAL
-
+        self.MinimizeBox = self.MaximizeBox = False
+        self.BackColor   = Drawing.Color.White
+        self.Font        = _FONT_NORMAL
         lbl_rev = WinForms.Label()
-        lbl_rev.Text = "Revision label (e.g. Rev A, v1.2):"
+        lbl_rev.Text = "Revision label:"
         lbl_rev.Location = Drawing.Point(12, 14)
         lbl_rev.AutoSize = True
         self.Controls.Add(lbl_rev)
-
         self._tb_rev = WinForms.TextBox()
         self._tb_rev.Location = Drawing.Point(12, 36)
         self._tb_rev.Size     = Drawing.Size(420, 28)
         self._tb_rev.Text     = current_rev
         self.Controls.Add(self._tb_rev)
-
         lbl_note = WinForms.Label()
         lbl_note.Text = "Change note:"
         lbl_note.Location = Drawing.Point(12, 74)
         lbl_note.AutoSize = True
         self.Controls.Add(lbl_note)
-
         self._tb_note = WinForms.TextBox()
         self._tb_note.Multiline = True
         self._tb_note.Location  = Drawing.Point(12, 96)
         self._tb_note.Size      = Drawing.Size(420, 68)
         self.Controls.Add(self._tb_note)
-
         self.Controls.Add(_make_btn("Save",   240, 172, 90, 32, primary=True,
                                     handler=self._ok))
         self.Controls.Add(_make_btn("Cancel", 340, 172, 90, 32,
@@ -331,16 +291,110 @@ class RevisionDialog(WinForms.Form):
         self.Close()
 
 
+class ArchiveProgressDialog(WinForms.Form):
+    """Determinate progress dialog parented to RepositoryForm."""
+
+    def __init__(self, label_text, owner=None):
+        self._success = False
+        self.Text          = "Working..."
+        self.Width         = 540
+        self.Height        = 170
+        self.FormBorderStyle = WinForms.FormBorderStyle.FixedDialog
+        self.MinimizeBox = self.MaximizeBox = self.ControlBox = False
+        self.BackColor   = Drawing.Color.White
+        self.Font        = _FONT_NORMAL
+        if owner is not None:
+            self.StartPosition = WinForms.FormStartPosition.CenterParent
+            self.Owner = owner
+        else:
+            self.StartPosition = WinForms.FormStartPosition.CenterScreen
+
+        lbl = WinForms.Label()
+        lbl.Text = label_text
+        lbl.Location = Drawing.Point(16, 14)
+        lbl.Size     = Drawing.Size(500, 20)
+        lbl.Font     = _FONT_BOLD
+        self.Controls.Add(lbl)
+
+        self._lbl_file = WinForms.Label()
+        self._lbl_file.ForeColor = Drawing.Color.FromArgb(60, 60, 60)
+        self._lbl_file.Location  = Drawing.Point(16, 40)
+        self._lbl_file.Size      = Drawing.Size(500, 18)
+        self.Controls.Add(self._lbl_file)
+
+        self._lbl_count = WinForms.Label()
+        self._lbl_count.Font      = _FONT_SMALL
+        self._lbl_count.ForeColor = Drawing.Color.Gray
+        self._lbl_count.Location  = Drawing.Point(16, 60)
+        self._lbl_count.Size      = Drawing.Size(500, 16)
+        self.Controls.Add(self._lbl_count)
+
+        self._bar = WinForms.ProgressBar()
+        self._bar.Minimum  = 0
+        self._bar.Maximum  = 100
+        self._bar.Value    = 0
+        self._bar.Style    = WinForms.ProgressBarStyle.Continuous
+        self._bar.Location = Drawing.Point(16, 84)
+        self._bar.Size     = Drawing.Size(500, 22)
+        self.Controls.Add(self._bar)
+
+        self._lbl_pct = WinForms.Label()
+        self._lbl_pct.Text      = "0%"
+        self._lbl_pct.Font      = _FONT_SMALL
+        self._lbl_pct.ForeColor = Drawing.Color.Gray
+        self._lbl_pct.Location  = Drawing.Point(16, 110)
+        self._lbl_pct.AutoSize  = True
+        self.Controls.Add(self._lbl_pct)
+
+    def set_progress(self, current, total, filename=""):
+        try:
+            pct = int(100.0 * current / total) if total > 0 else 0
+            self._bar.Value      = min(pct, 100)
+            self._lbl_pct.Text   = "{0}%".format(pct)
+            self._lbl_count.Text = "{0} / {1} files".format(current, total)
+            if filename:
+                disp = filename if len(filename) <= 55 else "..." + filename[-52:]
+                self._lbl_file.Text = disp
+            WinForms.Application.DoEvents()
+        except Exception:
+            pass
+
+    def set_status(self, msg):
+        try:
+            self._lbl_file.Text = msg
+            WinForms.Application.DoEvents()
+        except Exception:
+            pass
+
+    def finish_success(self):
+        self._success = True
+        try:
+            self._bar.Value    = 100
+            self._lbl_pct.Text = "100%"
+            self._lbl_file.Text = u"\u2714 Complete."
+            WinForms.Application.DoEvents()
+            System.Threading.Thread.Sleep(300)
+            self.DialogResult = WinForms.DialogResult.OK
+            self.Close()
+        except Exception:
+            pass
+
+    @property
+    def succeeded(self):
+        return self._success
+
+
 # ────────────────────────────────────────────────────────────────────────────
-#  Health-check dialog
+#  Health-check dialog  (with orphan section)
 # ────────────────────────────────────────────────────────────────────────────
 
 class HealthCheckDialog(WinForms.Form):
-    def __init__(self, health):
-        self._health = health
+    def __init__(self, health, owner_form=None):
+        self._health     = health
+        self._owner_form = owner_form
         self.Text          = "Repository Health Check"
-        self.Width         = 740
-        self.Height        = 520
+        self.Width         = 780
+        self.Height        = 620
         self.StartPosition = WinForms.FormStartPosition.CenterParent
         self.MinimizeBox   = False
         self.MaximizeBox   = True
@@ -352,8 +406,10 @@ class HealthCheckDialog(WinForms.Form):
         ready    = health["ready"]
         arch_ok  = health.get("archived_ok", 0)
         arch_old = health.get("archived_old", 0)
-        colour   = _CLR_MISSING if missing > 0 else _CLR_READY
-        icon     = u"\u2718 ISSUES FOUND" if missing > 0 else u"\u2714 ALL FILES OK"
+        orphans  = health.get("orphaned", [])
+        issues   = missing + arch_old + len(orphans)
+        colour   = _CLR_MISSING if issues > 0 else _CLR_READY
+        icon     = u"\u2718 ISSUES FOUND" if issues > 0 else u"\u2714 ALL OK"
 
         lbl_icon = WinForms.Label()
         lbl_icon.Text      = icon
@@ -365,70 +421,133 @@ class HealthCheckDialog(WinForms.Form):
 
         lbl_sum = WinForms.Label()
         lbl_sum.Text = ("Total: {0}   Ready: {1}   Missing: {2}   "
-                        "Archived OK: {3}   Outdated: {4}".format(
-                            total, ready, missing, arch_ok, arch_old))
+                        "Archived OK: {3}   Outdated: {4}   "
+                        "Orphaned: {5}".format(
+                            total, ready, missing, arch_ok,
+                            arch_old, len(orphans)))
         lbl_sum.Location = Drawing.Point(16, 46)
         lbl_sum.AutoSize = True
         self.Controls.Add(lbl_sum)
 
-        if missing > 0:
-            lbl_hint = WinForms.Label()
-            lbl_hint.Text = u"Select a missing file and click \u27A1 Relink."
-            lbl_hint.Font      = _FONT_SMALL
-            lbl_hint.ForeColor = Drawing.Color.Gray
-            lbl_hint.Location  = Drawing.Point(16, 66)
-            lbl_hint.AutoSize  = True
-            self.Controls.Add(lbl_hint)
+        y = 72
 
-        self._lv = WinForms.ListView()
-        self._lv.View         = WinForms.View.Details
-        self._lv.FullRowSelect = True
-        self._lv.GridLines     = True
-        self._lv.Location      = Drawing.Point(16, 86)
-        self._lv.Size          = Drawing.Size(690, 340)
-        self._lv.Font          = _FONT_NORMAL
-        self._lv.Columns.Add("Section",   160)
-        self._lv.Columns.Add("File Name", 200)
-        self._lv.Columns.Add("Path",      310)
+        # Missing files section
+        lbl_ms = WinForms.Label()
+        lbl_ms.Text = u"Missing Source Files  \u2014  select a row and click Relink:"
+        lbl_ms.Font = _FONT_BOLD
+        lbl_ms.Location = Drawing.Point(16, y)
+        lbl_ms.AutoSize = True
+        self.Controls.Add(lbl_ms)
+        y += 22
 
-        if missing == 0:
-            item = self._lv.Items.Add(u"\u2014")
-            item.SubItems.Add("No missing files detected.")
+        self._lv_missing = WinForms.ListView()
+        self._lv_missing.View         = WinForms.View.Details
+        self._lv_missing.FullRowSelect = True
+        self._lv_missing.GridLines     = True
+        self._lv_missing.Location      = Drawing.Point(16, y)
+        self._lv_missing.Size          = Drawing.Size(730, 130)
+        self._lv_missing.Font          = _FONT_NORMAL
+        self._lv_missing.Columns.Add("Section",   160)
+        self._lv_missing.Columns.Add("File Name", 200)
+        self._lv_missing.Columns.Add("Path",      350)
+
+        if not health["missing_list"]:
+            item = self._lv_missing.Items.Add(u"\u2014")
+            item.SubItems.Add("No missing source files.")
             item.SubItems.Add("")
         else:
             for m in health["missing_list"]:
-                item = self._lv.Items.Add(m["section"])
+                item = self._lv_missing.Items.Add(m["section"])
                 item.SubItems.Add(m["label"])
                 item.SubItems.Add(m["path"])
                 item.ForeColor = _CLR_MISSING
 
-        self.Controls.Add(self._lv)
+        self.Controls.Add(self._lv_missing)
+        y += 134
 
         self._btn_relink = _make_btn(u"\u27A1  Relink Selected\u2026",
-                                      16, 440, 160, 32,
+                                      16, y, 160, 28,
                                       handler=self._on_relink)
         self._btn_relink.Enabled = (missing > 0)
         self.Controls.Add(self._btn_relink)
-        self._lv.SelectedIndexChanged += self._on_sel_changed
+        self._lv_missing.SelectedIndexChanged += self._on_missing_sel
+        y += 38
 
-        self.Controls.Add(_make_btn("Close", 620, 440, 100, 32, primary=True,
+        # Orphaned files section
+        lbl_or = WinForms.Label()
+        lbl_or.Text = u"Orphaned Archive Files  \u2014  in repository with no manifest entry:"
+        lbl_or.Font = _FONT_BOLD
+        lbl_or.Location = Drawing.Point(16, y)
+        lbl_or.AutoSize = True
+        self.Controls.Add(lbl_or)
+        y += 22
+
+        self._lv_orphans = WinForms.ListView()
+        self._lv_orphans.View         = WinForms.View.Details
+        self._lv_orphans.FullRowSelect = True
+        self._lv_orphans.GridLines     = True
+        self._lv_orphans.Location      = Drawing.Point(16, y)
+        self._lv_orphans.Size          = Drawing.Size(730, 110)
+        self._lv_orphans.Font          = _FONT_NORMAL
+        self._lv_orphans.Columns.Add("Section",   160)
+        self._lv_orphans.Columns.Add("Filename",  240)
+        self._lv_orphans.Columns.Add("Full Path", 310)
+        self._orphan_data = list(orphans)
+
+        if not orphans:
+            item = self._lv_orphans.Items.Add(u"\u2014")
+            item.SubItems.Add("No orphaned archive files found.")
+            item.SubItems.Add("")
+        else:
+            for o in orphans:
+                item = self._lv_orphans.Items.Add(
+                    repo.SECTION_LABELS.get(o["section"], o["section"]))
+                item.SubItems.Add(o["filename"])
+                item.SubItems.Add(o["path"])
+                item.ForeColor = _CLR_ARCHIVED_OLD
+
+        self.Controls.Add(self._lv_orphans)
+        y += 114
+
+        self._btn_del_orphan = _make_btn(u"\u2716  Delete Selected Orphan",
+                                          16, y, 200, 28,
+                                          handler=self._on_delete_orphan)
+        self._btn_del_orphan.Enabled = bool(orphans)
+        self.Controls.Add(self._btn_del_orphan)
+
+        lbl_hint = WinForms.Label()
+        lbl_hint.Text = ("Select a row and click Delete to remove from disk, "
+                         "or close to ignore.")
+        lbl_hint.Font      = _FONT_SMALL
+        lbl_hint.ForeColor = Drawing.Color.Gray
+        lbl_hint.Location  = Drawing.Point(224, y + 6)
+        lbl_hint.Size      = Drawing.Size(520, 18)
+        self.Controls.Add(lbl_hint)
+        self._lv_orphans.SelectedIndexChanged += self._on_orphan_sel
+        y += 38
+
+        self.Controls.Add(_make_btn("Close", 640, y, 100, 32, primary=True,
                                     handler=lambda s, e: self.Close()))
+        self.Height = y + 70
 
-    def _on_sel_changed(self, s, e):
-        self._btn_relink.Enabled = (self._lv.SelectedItems.Count == 1)
+    def _on_missing_sel(self, s, e):
+        self._btn_relink.Enabled = (self._lv_missing.SelectedItems.Count == 1)
+
+    def _on_orphan_sel(self, s, e):
+        self._btn_del_orphan.Enabled = (self._lv_orphans.SelectedItems.Count == 1)
 
     def _on_relink(self, s, e):
         try:
-            if self._lv.SelectedItems.Count != 1:
+            if self._lv_missing.SelectedItems.Count != 1:
                 return
-            selected = self._lv.SelectedItems[0]
-            label    = selected.SubItems[1].Text
-            old_path = selected.SubItems[2].Text
+            sel      = self._lv_missing.SelectedItems[0]
+            label    = sel.SubItems[1].Text
+            old_path = sel.SubItems[2].Text
             old_name = os.path.basename(old_path) if old_path else label
-            section, index = self._find_record(label, old_path)
-            if section is None:
+            sec, idx = self._find_record(label, old_path)
+            if sec is None:
                 WinForms.MessageBox.Show(
-                    "Could not locate this record.\nClose and Refresh, then try again.",
+                    "Could not locate this record.\nClose and Refresh.",
                     "Relink Error")
                 return
             dlg = WinForms.OpenFileDialog()
@@ -437,19 +556,44 @@ class HealthCheckDialog(WinForms.Form):
             dlg.FileName = old_name
             if dlg.ShowDialog() != WinForms.DialogResult.OK:
                 return
-            repo.relink_file_record(section, index, dlg.FileName)
-            selected.SubItems[2].Text = dlg.FileName
-            selected.SubItems[1].Text = os.path.basename(dlg.FileName)
-            selected.ForeColor        = _CLR_READY
-            still = sum(1 for i in range(self._lv.Items.Count)
-                        if self._lv.Items[i].ForeColor == _CLR_MISSING)
-            if still == 0:
-                WinForms.MessageBox.Show(
-                    u"\u2714 All missing files relinked.\nClose then Refresh.",
-                    "Relink Complete")
+            repo.relink_file_record(sec, idx, dlg.FileName)
+            sel.SubItems[2].Text = dlg.FileName
+            sel.SubItems[1].Text = os.path.basename(dlg.FileName)
+            sel.ForeColor        = _CLR_READY
         except Exception as exc:
-            _log("Health check relink error: " + str(exc))
+            _log("Health relink error: " + str(exc))
             WinForms.MessageBox.Show("Relink failed:\n" + str(exc), "Error")
+
+    def _on_delete_orphan(self, s, e):
+        try:
+            if self._lv_orphans.SelectedItems.Count != 1:
+                return
+            sel_item = self._lv_orphans.SelectedItems[0]
+            idx = sel_item.Index
+            if idx < 0 or idx >= len(self._orphan_data):
+                return
+            orphan = self._orphan_data[idx]
+            path   = orphan["path"]
+            if WinForms.MessageBox.Show(
+                    u"Permanently delete from disk?\n\n{0}".format(path),
+                    u"Confirm Delete",
+                    WinForms.MessageBoxButtons.YesNo,
+                    WinForms.MessageBoxIcon.Warning
+                    ) != WinForms.DialogResult.Yes:
+                return
+            try:
+                if orphan.get("is_dir"):
+                    shutil.rmtree(path)
+                else:
+                    os.remove(path)
+                sel_item.ForeColor = Drawing.Color.Gray
+                sel_item.SubItems[1].Text += "  (deleted)"
+                _log("Deleted orphan: " + path)
+                self._orphan_data.pop(idx)
+            except Exception as exc:
+                WinForms.MessageBox.Show("Delete failed:\n" + str(exc), "Error")
+        except Exception as exc:
+            _log("Delete orphan error: " + str(exc))
 
     def _find_record(self, label, old_path):
         try:
@@ -466,130 +610,30 @@ class HealthCheckDialog(WinForms.Form):
 
 
 # ────────────────────────────────────────────────────────────────────────────
-#  Archive progress dialog
-# ────────────────────────────────────────────────────────────────────────────
-
-class ArchiveProgressDialog(WinForms.Form):
-    """Marquee progress dialog for copy/zip/extract operations."""
-
-    def __init__(self, label_text, process=None):
-        self._process = process
-        self._success = False
-        self._elapsed = 0
-
-        self.Text          = "Working..."
-        self.Width         = 520
-        self.Height        = 160
-        self.StartPosition = WinForms.FormStartPosition.CenterParent
-        self.MinimizeBox   = False
-        self.MaximizeBox   = False
-        self.ControlBox    = False
-        self.BackColor     = Drawing.Color.White
-        self.Font          = _FONT_NORMAL
-
-        lbl = WinForms.Label()
-        lbl.Text     = label_text
-        lbl.Location = Drawing.Point(16, 16)
-        lbl.Size     = Drawing.Size(480, 20)
-        lbl.Font     = _FONT_BOLD
-        self.Controls.Add(lbl)
-
-        self._lbl_status = WinForms.Label()
-        self._lbl_status.Text      = "Working..."
-        self._lbl_status.ForeColor = Drawing.Color.FromArgb(80, 80, 80)
-        self._lbl_status.Location  = Drawing.Point(16, 44)
-        self._lbl_status.Size      = Drawing.Size(480, 20)
-        self.Controls.Add(self._lbl_status)
-
-        self._lbl_time = WinForms.Label()
-        self._lbl_time.Text      = ""
-        self._lbl_time.ForeColor = Drawing.Color.Gray
-        self._lbl_time.Font      = _FONT_SMALL
-        self._lbl_time.Location  = Drawing.Point(16, 64)
-        self._lbl_time.Size      = Drawing.Size(480, 16)
-        self.Controls.Add(self._lbl_time)
-
-        bar = WinForms.ProgressBar()
-        bar.Style    = WinForms.ProgressBarStyle.Marquee
-        bar.Location = Drawing.Point(16, 88)
-        bar.Size     = Drawing.Size(480, 22)
-        self.Controls.Add(bar)
-
-        self._timer = WinForms.Timer()
-        self._timer.Interval = 500
-        self._timer.Tick    += self._on_tick
-        self._timer.Start()
-
-    def set_status(self, msg):
-        self._lbl_status.Text = msg
-        WinForms.Application.DoEvents()
-
-    def finish_success(self):
-        self._timer.Stop()
-        self._success = True
-        self._lbl_status.Text = u"\u2714 Done."
-        WinForms.Application.DoEvents()
-        System.Threading.Thread.Sleep(300)
-        self.DialogResult = WinForms.DialogResult.OK
-        self.Close()
-
-    def _on_tick(self, s, e):
-        try:
-            self._elapsed += 0.5
-            self._lbl_time.Text = "Elapsed: {0:.0f}s".format(self._elapsed)
-            if self._process is not None and self._process.HasExited:
-                self._timer.Stop()
-                self._success = (self._process.ExitCode == 0)
-                self._lbl_status.Text = (u"\u2714 Complete." if self._success
-                                         else u"\u26A0 Completed with warnings.")
-                WinForms.Application.DoEvents()
-                System.Threading.Thread.Sleep(600)
-                self.DialogResult = WinForms.DialogResult.OK
-                self.Close()
-        except Exception as exc:
-            self._timer.Stop()
-            _log("ArchiveProgressDialog tick error: " + str(exc))
-            self.Close()
-
-    @property
-    def succeeded(self):
-        return self._success
-
-
-# ────────────────────────────────────────────────────────────────────────────
-#  Open Choice dialog  (source vs archive for non-ZIP archived files)
+#  Open choice dialog  (source vs archive for non-ZIP archived files)
 # ────────────────────────────────────────────────────────────────────────────
 
 class OpenChoiceDialog(WinForms.Form):
-    """
-    Shown when a file has both a source reference and a non-ZIP archive copy.
-    User chooses which to open.
-    """
-
     def __init__(self, record):
         self.open_path = ""
-
-        src  = record.get("source_path", "")
-        arch = record.get("archive_path", "")
+        src   = record.get("source_path", "")
+        arch  = repo._resolve_archive_path(record.get("archive_path", ""))
         label = record.get("label", "File")
-
         self.Text          = u"Open: {0}".format(label)
-        self.Width         = 640
+        self.Width         = 660
         self.Height        = 300
         self.StartPosition = WinForms.FormStartPosition.CenterParent
-        self.MinimizeBox   = False
-        self.MaximizeBox   = False
-        self.BackColor     = Drawing.Color.White
-        self.Font          = _FONT_NORMAL
+        self.MinimizeBox = self.MaximizeBox = False
+        self.BackColor   = Drawing.Color.White
+        self.Font        = _FONT_NORMAL
 
-        lbl_hdr = WinForms.Label()
-        lbl_hdr.Text = ("This file has both a source reference and an "
-                        "archive copy. Which would you like to open?")
-        lbl_hdr.Location = Drawing.Point(16, 14)
-        lbl_hdr.Size     = Drawing.Size(594, 34)
-        self.Controls.Add(lbl_hdr)
+        lbl = WinForms.Label()
+        lbl.Text = ("This file has both a source reference and an archive copy.\n"
+                    "Which would you like to open?")
+        lbl.Location = Drawing.Point(16, 14)
+        lbl.Size     = Drawing.Size(620, 34)
+        self.Controls.Add(lbl)
 
-        # Source option
         self._rb_src = WinForms.RadioButton()
         self._rb_src.Text     = "Open source file  (current working version)"
         self._rb_src.Location = Drawing.Point(16, 58)
@@ -597,69 +641,62 @@ class OpenChoiceDialog(WinForms.Form):
         self._rb_src.Checked  = True
         self.Controls.Add(self._rb_src)
 
-        lbl_src_path = WinForms.Label()
-        lbl_src_path.Text      = "   " + src
-        lbl_src_path.Font      = _FONT_SMALL
-        lbl_src_path.ForeColor = Drawing.Color.FromArgb(60, 60, 60)
-        lbl_src_path.Location  = Drawing.Point(28, 80)
-        lbl_src_path.Size      = Drawing.Size(580, 16)
-        self.Controls.Add(lbl_src_path)
+        lbl_sp = WinForms.Label()
+        lbl_sp.Text = "   " + src
+        lbl_sp.Font = _FONT_SMALL
+        lbl_sp.ForeColor = Drawing.Color.FromArgb(60, 60, 60)
+        lbl_sp.Location  = Drawing.Point(28, 80)
+        lbl_sp.Size      = Drawing.Size(610, 16)
+        self.Controls.Add(lbl_sp)
 
         try:
-            src_mod = datetime.datetime.fromtimestamp(
-                os.path.getmtime(src)).strftime("%Y-%m-%d %H:%M")
-            src_sz  = "{0:.2f} MB".format(
+            src_info = u"   Modified: {0}   Size: {1:.2f} MB".format(
+                datetime.datetime.fromtimestamp(
+                    os.path.getmtime(src)).strftime("%Y-%m-%d %H:%M"),
                 os.path.getsize(src) / (1024.0 * 1024))
         except Exception:
-            src_mod = ""
-            src_sz  = ""
+            src_info = ""
+        lbl_si = WinForms.Label()
+        lbl_si.Text = src_info
+        lbl_si.Font = _FONT_SMALL
+        lbl_si.ForeColor = Drawing.Color.Gray
+        lbl_si.Location  = Drawing.Point(28, 96)
+        lbl_si.Size      = Drawing.Size(610, 16)
+        self.Controls.Add(lbl_si)
 
-        lbl_src_info = WinForms.Label()
-        lbl_src_info.Text      = u"   Modified: {0}   Size: {1}".format(
-            src_mod, src_sz)
-        lbl_src_info.Font      = _FONT_SMALL
-        lbl_src_info.ForeColor = Drawing.Color.Gray
-        lbl_src_info.Location  = Drawing.Point(28, 96)
-        lbl_src_info.Size      = Drawing.Size(580, 16)
-        self.Controls.Add(lbl_src_info)
-
-        # Separator
         sep = WinForms.Label()
         sep.BorderStyle = WinForms.BorderStyle.Fixed3D
-        sep.Location    = Drawing.Point(16, 122)
-        sep.Size        = Drawing.Size(594, 2)
+        sep.Location = Drawing.Point(16, 120)
+        sep.Size     = Drawing.Size(614, 2)
         self.Controls.Add(sep)
 
-        # Archive option
         self._rb_arch = WinForms.RadioButton()
-        self._rb_arch.Text     = "Open archive copy  (snapshot saved to repository)"
-        self._rb_arch.Location = Drawing.Point(16, 132)
+        self._rb_arch.Text     = "Open archive copy  (snapshot in repository)"
+        self._rb_arch.Location = Drawing.Point(16, 130)
         self._rb_arch.Size     = Drawing.Size(580, 20)
         self.Controls.Add(self._rb_arch)
 
-        lbl_arch_path = WinForms.Label()
-        lbl_arch_path.Text      = "   " + arch
-        lbl_arch_path.Font      = _FONT_SMALL
-        lbl_arch_path.ForeColor = Drawing.Color.FromArgb(60, 60, 60)
-        lbl_arch_path.Location  = Drawing.Point(28, 154)
-        lbl_arch_path.Size      = Drawing.Size(580, 16)
-        self.Controls.Add(lbl_arch_path)
+        lbl_ap = WinForms.Label()
+        lbl_ap.Text = "   " + arch
+        lbl_ap.Font = _FONT_SMALL
+        lbl_ap.ForeColor = Drawing.Color.FromArgb(60, 60, 60)
+        lbl_ap.Location  = Drawing.Point(28, 152)
+        lbl_ap.Size      = Drawing.Size(610, 16)
+        self.Controls.Add(lbl_ap)
 
-        arch_date = record.get("archive_date", "")
-        lbl_arch_info = WinForms.Label()
-        lbl_arch_info.Text      = u"   Archived: {0}".format(arch_date)
-        lbl_arch_info.Font      = _FONT_SMALL
-        lbl_arch_info.ForeColor = Drawing.Color.Gray
-        lbl_arch_info.Location  = Drawing.Point(28, 170)
-        lbl_arch_info.Size      = Drawing.Size(580, 16)
-        self.Controls.Add(lbl_arch_info)
+        lbl_ad = WinForms.Label()
+        lbl_ad.Text = u"   Archived: " + record.get("archive_date", "")
+        lbl_ad.Font = _FONT_SMALL
+        lbl_ad.ForeColor = Drawing.Color.Gray
+        lbl_ad.Location  = Drawing.Point(28, 168)
+        lbl_ad.Size      = Drawing.Size(610, 16)
+        self.Controls.Add(lbl_ad)
 
         self._src  = src
         self._arch = arch
-
-        self.Controls.Add(_make_btn("Open Selected", 340, 230, 140, 34,
+        self.Controls.Add(_make_btn("Open Selected", 370, 230, 150, 34,
                                     primary=True, handler=self._open))
-        self.Controls.Add(_make_btn("Cancel", 488, 230, 90, 34,
+        self.Controls.Add(_make_btn("Cancel", 528, 230, 100, 34,
                                     handler=lambda s, e: self.Close()))
 
     def _open(self, s, e):
@@ -669,130 +706,114 @@ class OpenChoiceDialog(WinForms.Form):
 
 
 # ────────────────────────────────────────────────────────────────────────────
-#  ZIP extract dialog  (first-time extraction location chooser)
+#  ZIP extract dialog  (first-time / flat extraction)
 # ────────────────────────────────────────────────────────────────────────────
 
 class ZipExtractDialog(WinForms.Form):
-    """
-    Shown on first open of a ZIP-archived .wbpj.
-    User chooses to extract beside the ZIP or to a custom location.
-    """
-
     def __init__(self, zip_path, label):
-        self.chosen_dest   = ""   # chosen extraction directory
-        self._zip_path     = zip_path
-        self._label        = label
-
-        project_name    = os.path.splitext(os.path.basename(zip_path))[0]
-        zip_dir         = os.path.dirname(zip_path)
-        self._beside    = os.path.join(zip_dir, project_name)
-        self._custom    = ""
+        self.chosen_dest = ""
+        self._zip_path   = zip_path
+        self._label      = label
+        # Default: flat beside ZIP (same directory as the ZIP)
+        self._beside = os.path.dirname(zip_path)
+        self._custom = ""
 
         self.Text          = u"Extract Archive: {0}".format(label)
         self.Width         = 660
-        self.Height        = 310
+        self.Height        = 280
         self.StartPosition = WinForms.FormStartPosition.CenterParent
-        self.MinimizeBox   = False
-        self.MaximizeBox   = False
-        self.BackColor     = Drawing.Color.White
-        self.Font          = _FONT_NORMAL
+        self.MinimizeBox = self.MaximizeBox = False
+        self.BackColor   = Drawing.Color.White
+        self.Font        = _FONT_NORMAL
 
         lbl_hdr = WinForms.Label()
         lbl_hdr.Text = ("This file is stored as a ZIP archive. "
-                        "Choose where to extract it before opening.")
+                        "Choose where to extract it.")
         lbl_hdr.Location = Drawing.Point(16, 14)
-        lbl_hdr.Size     = Drawing.Size(614, 30)
+        lbl_hdr.Size     = Drawing.Size(620, 20)
         self.Controls.Add(lbl_hdr)
 
-        # Option A — beside ZIP
         self._rb_beside = WinForms.RadioButton()
-        self._rb_beside.Text     = "Extract beside ZIP  (inside repository folder)"
-        self._rb_beside.Location = Drawing.Point(16, 54)
+        self._rb_beside.Text     = "Extract to repository folder  (alongside ZIP)"
+        self._rb_beside.Location = Drawing.Point(16, 44)
         self._rb_beside.Size     = Drawing.Size(500, 20)
         self._rb_beside.Checked  = True
-        self._rb_beside.CheckedChanged += self._on_rb_changed
+        self._rb_beside.CheckedChanged += self._on_rb
         self.Controls.Add(self._rb_beside)
 
-        self._lbl_beside = WinForms.Label()
-        self._lbl_beside.Text      = "   " + self._beside
-        self._lbl_beside.Font      = _FONT_SMALL
-        self._lbl_beside.ForeColor = Drawing.Color.Gray
-        self._lbl_beside.Location  = Drawing.Point(28, 76)
-        self._lbl_beside.Size      = Drawing.Size(610, 16)
-        self.Controls.Add(self._lbl_beside)
+        lbl_bd = WinForms.Label()
+        lbl_bd.Text = "   " + self._beside
+        lbl_bd.Font = _FONT_SMALL
+        lbl_bd.ForeColor = Drawing.Color.Gray
+        lbl_bd.Location  = Drawing.Point(28, 66)
+        lbl_bd.Size      = Drawing.Size(610, 16)
+        self.Controls.Add(lbl_bd)
 
-        # Option B — custom location
         self._rb_custom = WinForms.RadioButton()
         self._rb_custom.Text     = "Extract to another location"
-        self._rb_custom.Location = Drawing.Point(16, 104)
+        self._rb_custom.Location = Drawing.Point(16, 92)
         self._rb_custom.Size     = Drawing.Size(300, 20)
-        self._rb_custom.CheckedChanged += self._on_rb_changed
+        self._rb_custom.CheckedChanged += self._on_rb
         self.Controls.Add(self._rb_custom)
 
         self._tb_custom = WinForms.TextBox()
-        self._tb_custom.Location = Drawing.Point(28, 128)
-        self._tb_custom.Size     = Drawing.Size(480, 24)
+        self._tb_custom.Location = Drawing.Point(28, 116)
+        self._tb_custom.Size     = Drawing.Size(490, 24)
         self._tb_custom.Enabled  = False
         self.Controls.Add(self._tb_custom)
 
-        self._btn_browse = _make_btn("Browse...", 516, 127, 90, 26,
+        self._btn_browse = _make_btn("Browse...", 526, 115, 90, 26,
                                       handler=self._browse)
         self._btn_browse.Enabled = False
         self.Controls.Add(self._btn_browse)
 
         self._lbl_dest = WinForms.Label()
-        self._lbl_dest.Text      = ""
         self._lbl_dest.Font      = _FONT_SMALL
         self._lbl_dest.ForeColor = Drawing.Color.Gray
-        self._lbl_dest.Location  = Drawing.Point(28, 156)
+        self._lbl_dest.Location  = Drawing.Point(28, 144)
         self._lbl_dest.Size      = Drawing.Size(610, 16)
         self.Controls.Add(self._lbl_dest)
 
-        # Size warning
         try:
             zip_size = os.path.getsize(zip_path)
             if zip_size > SIZE_WARN_BYTES:
                 lbl_warn = WinForms.Label()
-                lbl_warn.Text = (u"\u26A0 This archive is {0} — extraction "
-                                 u"may take several minutes.".format(
+                lbl_warn.Text = (u"\u26A0 Archive is {0} -- "
+                                 u"extraction may take several minutes.".format(
                                      repo.format_size(zip_size)))
-                lbl_warn.Font      = _FONT_SMALL
+                lbl_warn.Font = _FONT_SMALL
                 lbl_warn.ForeColor = _CLR_ARCHIVED_OLD
-                lbl_warn.Location  = Drawing.Point(16, 180)
-                lbl_warn.Size      = Drawing.Size(614, 16)
+                lbl_warn.Location  = Drawing.Point(16, 166)
+                lbl_warn.Size      = Drawing.Size(620, 16)
                 self.Controls.Add(lbl_warn)
         except Exception:
             pass
 
-        self.Controls.Add(_make_btn("Extract and Open", 340, 238, 160, 34,
+        self.Controls.Add(_make_btn("Extract and Open", 350, 214, 160, 34,
                                     primary=True, handler=self._extract))
-        self.Controls.Add(_make_btn("Cancel", 508, 238, 90, 34,
+        self.Controls.Add(_make_btn("Cancel", 518, 214, 100, 34,
                                     handler=lambda s, e: self.Close()))
 
-    def _on_rb_changed(self, s, e):
+    def _on_rb(self, s, e):
         custom = self._rb_custom.Checked
         self._tb_custom.Enabled  = custom
         self._btn_browse.Enabled = custom
-        self._lbl_dest.Text = ""
 
     def _browse(self, s, e):
         dlg = WinForms.FolderBrowserDialog()
         dlg.Description = "Choose extraction folder"
         if dlg.ShowDialog() == WinForms.DialogResult.OK:
-            project_name    = os.path.splitext(
-                os.path.basename(self._zip_path))[0]
-            self._custom    = os.path.join(dlg.SelectedPath, project_name)
+            self._custom = dlg.SelectedPath
             self._tb_custom.Text = dlg.SelectedPath
-            self._lbl_dest.Text = u"Will extract to: " + self._custom
+            self._lbl_dest.Text  = u"Will extract to: " + dlg.SelectedPath
 
     def _extract(self, s, e):
         if self._rb_beside.Checked:
             self.chosen_dest = self._beside
         else:
             if not self._custom:
-                WinForms.MessageBox.Show(
-                    "Please browse to choose an extraction folder.",
-                    "No Folder Selected")
+                WinForms.MessageBox.Show("Please choose an extraction folder.",
+                                         "No Folder Selected")
                 return
             self.chosen_dest = self._custom
         self.DialogResult = WinForms.DialogResult.OK
@@ -800,99 +821,113 @@ class ZipExtractDialog(WinForms.Form):
 
 
 # ────────────────────────────────────────────────────────────────────────────
-#  ZIP open dialog  (subsequent opens of already-extracted ZIP)
+#  ZIP open dialog  (subsequent opens, includes "Open source" option)
 # ────────────────────────────────────────────────────────────────────────────
 
 class ZipOpenDialog(WinForms.Form):
-    """
-    Shown when a ZIP-archived .wbpj has already been extracted.
-    User chooses: open existing / re-extract / different location.
-    """
-
+    OPEN_SOURCE    = "source"
     OPEN_EXISTING  = "existing"
     RE_EXTRACT     = "re_extract"
     OTHER_LOCATION = "other"
 
-    def __init__(self, zip_path, extract_path, label):
-        self.action       = ""
-        self._zip_path    = zip_path
-        self._extract     = extract_path
-        self._label       = label
+    def __init__(self, zip_path, extract_path, label, source_path=""):
+        self.action      = ""
+        self._zip_path   = zip_path
+        self._extract    = extract_path
+        self._source     = source_path
+        self._has_source = bool(source_path) and os.path.exists(source_path)
 
         self.Text          = u"Open: {0}".format(label)
-        self.Width         = 660
-        self.Height        = 280
+        self.Width         = 680
+        self.Height        = 320 if self._has_source else 280
         self.StartPosition = WinForms.FormStartPosition.CenterParent
-        self.MinimizeBox   = False
-        self.MaximizeBox   = False
-        self.BackColor     = Drawing.Color.White
-        self.Font          = _FONT_NORMAL
+        self.MinimizeBox = self.MaximizeBox = False
+        self.BackColor   = Drawing.Color.White
+        self.Font        = _FONT_NORMAL
 
         lbl_hdr = WinForms.Label()
         lbl_hdr.Text = ("This archive was previously extracted. "
                         "What would you like to do?")
         lbl_hdr.Location = Drawing.Point(16, 14)
-        lbl_hdr.Size     = Drawing.Size(614, 20)
+        lbl_hdr.Size     = Drawing.Size(640, 20)
         self.Controls.Add(lbl_hdr)
 
-        # Option 1 — open existing
+        y = 44
+
+        if self._has_source:
+            self._rb_src = WinForms.RadioButton()
+            self._rb_src.Text     = u"Open original source file  (this machine only)"
+            self._rb_src.Location = Drawing.Point(16, y)
+            self._rb_src.Size     = Drawing.Size(580, 20)
+            self._rb_src.Checked  = True
+            self.Controls.Add(self._rb_src)
+            lbl_sp = WinForms.Label()
+            lbl_sp.Text = "   " + source_path
+            lbl_sp.Font = _FONT_SMALL
+            lbl_sp.ForeColor = Drawing.Color.Gray
+            lbl_sp.Location  = Drawing.Point(28, y + 22)
+            lbl_sp.Size      = Drawing.Size(630, 16)
+            self.Controls.Add(lbl_sp)
+            sep0 = WinForms.Label()
+            sep0.BorderStyle = WinForms.BorderStyle.Fixed3D
+            sep0.Location = Drawing.Point(16, y + 44)
+            sep0.Size     = Drawing.Size(640, 2)
+            self.Controls.Add(sep0)
+            y += 52
+        else:
+            self._rb_src = None
+
         self._rb_open = WinForms.RadioButton()
         self._rb_open.Text     = "Open existing extracted copy"
-        self._rb_open.Location = Drawing.Point(16, 46)
-        self._rb_open.Size     = Drawing.Size(400, 20)
-        self._rb_open.Checked  = True
+        self._rb_open.Location = Drawing.Point(16, y)
+        self._rb_open.Size     = Drawing.Size(500, 20)
+        if not self._has_source:
+            self._rb_open.Checked = True
         self.Controls.Add(self._rb_open)
-
-        lbl_ext = WinForms.Label()
-        lbl_ext.Text      = "   " + extract_path
-        lbl_ext.Font      = _FONT_SMALL
-        lbl_ext.ForeColor = Drawing.Color.Gray
-        lbl_ext.Location  = Drawing.Point(28, 68)
-        lbl_ext.Size      = Drawing.Size(610, 16)
-        self.Controls.Add(lbl_ext)
-
+        lbl_ep = WinForms.Label()
+        lbl_ep.Text = "   " + extract_path
+        lbl_ep.Font = _FONT_SMALL
+        lbl_ep.ForeColor = Drawing.Color.Gray
+        lbl_ep.Location  = Drawing.Point(28, y + 22)
+        lbl_ep.Size      = Drawing.Size(630, 16)
+        self.Controls.Add(lbl_ep)
         sep1 = WinForms.Label()
         sep1.BorderStyle = WinForms.BorderStyle.Fixed3D
-        sep1.Location    = Drawing.Point(16, 92)
-        sep1.Size        = Drawing.Size(614, 2)
+        sep1.Location = Drawing.Point(16, y + 44)
+        sep1.Size     = Drawing.Size(640, 2)
         self.Controls.Add(sep1)
+        y += 52
 
-        # Option 2 — re-extract
         self._rb_re = WinForms.RadioButton()
         self._rb_re.Text     = (u"Re-extract from ZIP  "
-                                u"(overwrites existing — use if ZIP was updated)")
-        self._rb_re.Location = Drawing.Point(16, 102)
+                                u"(use if ZIP was updated since last extraction)")
+        self._rb_re.Location = Drawing.Point(16, y)
         self._rb_re.Size     = Drawing.Size(580, 20)
         self.Controls.Add(self._rb_re)
-
-        lbl_zip = WinForms.Label()
-        lbl_zip.Text      = "   " + zip_path
-        lbl_zip.Font      = _FONT_SMALL
-        lbl_zip.ForeColor = Drawing.Color.Gray
-        lbl_zip.Location  = Drawing.Point(28, 124)
-        lbl_zip.Size      = Drawing.Size(610, 16)
-        self.Controls.Add(lbl_zip)
-
         sep2 = WinForms.Label()
         sep2.BorderStyle = WinForms.BorderStyle.Fixed3D
-        sep2.Location    = Drawing.Point(16, 148)
-        sep2.Size        = Drawing.Size(614, 2)
+        sep2.Location = Drawing.Point(16, y + 28)
+        sep2.Size     = Drawing.Size(640, 2)
         self.Controls.Add(sep2)
+        y += 36
 
-        # Option 3 — different location
         self._rb_other = WinForms.RadioButton()
         self._rb_other.Text     = "Extract to a different location"
-        self._rb_other.Location = Drawing.Point(16, 158)
+        self._rb_other.Location = Drawing.Point(16, y)
         self._rb_other.Size     = Drawing.Size(400, 20)
         self.Controls.Add(self._rb_other)
+        y += 34
 
-        self.Controls.Add(_make_btn("Open / Extract", 390, 212, 150, 34,
+        self.Controls.Add(_make_btn("Proceed", 440, y, 110, 34,
                                     primary=True, handler=self._ok))
-        self.Controls.Add(_make_btn("Cancel", 548, 212, 90, 34,
+        self.Controls.Add(_make_btn("Cancel", 558, y, 100, 34,
                                     handler=lambda s, e: self.Close()))
+        self.Height = y + 70
 
     def _ok(self, s, e):
-        if self._rb_open.Checked:
+        if self._rb_src is not None and self._rb_src.Checked:
+            self.action = self.OPEN_SOURCE
+        elif self._rb_open.Checked:
             self.action = self.OPEN_EXISTING
         elif self._rb_re.Checked:
             self.action = self.RE_EXTRACT
@@ -907,41 +942,40 @@ class ZipOpenDialog(WinForms.Form):
 # ────────────────────────────────────────────────────────────────────────────
 
 class ArchiveDialog(WinForms.Form):
-    """Checklist dialog for selecting files to archive."""
-
-    WBPJ_ZIP            = "zip"
+    WBPJ_ZIP             = "zip"
     WBPJ_COPY_WITH_FILES = "copy_with_files"
-    WBPJ_SKIP           = "skip"
+    WBPJ_SKIP            = "skip"
 
-    def __init__(self, candidates, open_project_path=None):
+    def __init__(self, candidates, open_project_path=None, owner=None):
         self._candidates       = candidates
-        self._open_proj        = open_project_path
+        self._owner            = owner
         self._archived_results = []
         self._has_wbpj         = any(c["is_wbpj"] for c in candidates)
 
         self.Text          = u"Archive Repository Files"
-        self.Width         = 900
+        self.Width         = 920
         self.Height        = 560 if self._has_wbpj else 460
         self.StartPosition = WinForms.FormStartPosition.CenterParent
-        self.MinimizeBox   = False
-        self.MaximizeBox   = True
-        self.BackColor     = Drawing.Color.White
-        self.Font          = _FONT_NORMAL
-
+        if owner:
+            self.Owner = owner
+        self.MinimizeBox = False
+        self.MaximizeBox = True
+        self.BackColor   = Drawing.Color.White
+        self.Font        = _FONT_NORMAL
         self._build_ui()
         self._populate_list()
 
     def _build_ui(self):
         y = 12
-
-        lbl_hdr = WinForms.Label()
-        lbl_hdr.Text = ("Select files to archive into the project repository. "
-                        "Files already archived show their current status.")
-        lbl_hdr.Location = Drawing.Point(16, y)
-        lbl_hdr.Size     = Drawing.Size(860, 18)
-        lbl_hdr.Font     = _FONT_SMALL
-        lbl_hdr.ForeColor = Drawing.Color.Gray
-        self.Controls.Add(lbl_hdr)
+        lbl = WinForms.Label()
+        lbl.Text = ("Select files to archive. "
+                    "Already-archived files show current status. "
+                    "Checked = will archive / re-archive.")
+        lbl.Font = _FONT_SMALL
+        lbl.ForeColor = Drawing.Color.Gray
+        lbl.Location = Drawing.Point(16, y)
+        lbl.Size     = Drawing.Size(880, 18)
+        self.Controls.Add(lbl)
         y += 28
 
         self.Controls.Add(_make_btn("Check All",   16, y, 100, 26,
@@ -950,31 +984,64 @@ class ArchiveDialog(WinForms.Form):
                                     handler=self._uncheck_all))
         y += 36
 
-        lv_height = 220
         self._lv = WinForms.ListView()
         self._lv.View         = WinForms.View.Details
         self._lv.CheckBoxes    = True
         self._lv.FullRowSelect = True
         self._lv.GridLines     = True
         self._lv.Location      = Drawing.Point(16, y)
-        self._lv.Size          = Drawing.Size(858, lv_height)
+        self._lv.Size          = Drawing.Size(880, 220)
         self._lv.Font          = _FONT_NORMAL
         self._lv.HeaderStyle   = WinForms.ColumnHeaderStyle.Nonclickable
-
         for name, w in [("Section", 150), ("File Name", 220),
                         ("Source Location", 240), ("Size", 80),
-                        ("Archive Status", 150)]:
+                        ("Archive Status", 170)]:
             self._lv.Columns.Add(name, w)
-
         self.Controls.Add(self._lv)
-        y += lv_height + 10
+        y += 230
 
         if self._has_wbpj:
-            self._wbpj_panel = self._build_wbpj_panel(y)
-            self.Controls.Add(self._wbpj_panel)
-            y += self._wbpj_panel.Height + 10
+            panel = WinForms.GroupBox()
+            panel.Text     = "Workbench Project (.wbpj) Archive Method"
+            panel.Location = Drawing.Point(16, y)
+            panel.Size     = Drawing.Size(880, 100)
+            panel.Font     = _FONT_NORMAL
+
+            self._rb_zip = WinForms.RadioButton()
+            self._rb_zip.Text     = u"Compress to ZIP  (recommended \u2014 works with any project)"
+            self._rb_zip.Location = Drawing.Point(12, 20)
+            self._rb_zip.Size     = Drawing.Size(560, 20)
+            self._rb_zip.Checked  = True
+            panel.Controls.Add(self._rb_zip)
+
+            lbl_rec = WinForms.Label()
+            lbl_rec.Text      = u"\u2714 Recommended"
+            lbl_rec.ForeColor = _CLR_GREEN_DIM
+            lbl_rec.Font      = _FONT_BOLD
+            lbl_rec.Location  = Drawing.Point(580, 22)
+            lbl_rec.AutoSize  = True
+            panel.Controls.Add(lbl_rec)
+
+            self._chk_results = WinForms.CheckBox()
+            self._chk_results.Text     = "Include result files (.rst, .db, etc.)"
+            self._chk_results.Location = Drawing.Point(34, 44)
+            self._chk_results.Size     = Drawing.Size(280, 20)
+            self._chk_results.Checked  = False
+            panel.Controls.Add(self._chk_results)
+
+            self._rb_copy = WinForms.RadioButton()
+            self._rb_copy.Text     = ("Copy .wbpj + _files  "
+                                      "(no compression, delta update on re-archive)")
+            self._rb_copy.Location = Drawing.Point(12, 70)
+            self._rb_copy.Size     = Drawing.Size(600, 20)
+            panel.Controls.Add(self._rb_copy)
+
+            self.Controls.Add(panel)
+            y += 110
         else:
-            self._wbpj_panel = None
+            self._rb_zip      = None
+            self._rb_copy     = None
+            self._chk_results = None
 
         btn_y = y + 4
         self.Controls.Add(_make_btn(u"\U0001F4E6  Archive Checked Files",
@@ -984,72 +1051,26 @@ class ArchiveDialog(WinForms.Form):
                                     handler=lambda s, e: self._cancel()))
         self.Height = btn_y + 80
 
-    def _build_wbpj_panel(self, top_y):
-        panel = WinForms.GroupBox()
-        panel.Text     = "Workbench Project (.wbpj) Archive Method"
-        panel.Location = Drawing.Point(16, top_y)
-        panel.Size     = Drawing.Size(858, 96)
-        panel.Font     = _FONT_NORMAL
-
-        self._rb_zip = WinForms.RadioButton()
-        self._rb_zip.Text    = u"Compress to ZIP  (recommended \u2014 works with any project)"
-        self._rb_zip.Location = Drawing.Point(12, 20)
-        self._rb_zip.Size    = Drawing.Size(560, 20)
-        self._rb_zip.Checked = True
-        panel.Controls.Add(self._rb_zip)
-
-        lbl_rec = WinForms.Label()
-        lbl_rec.Text      = u"\u2714 Recommended"
-        lbl_rec.ForeColor = _CLR_GREEN_DIM
-        lbl_rec.Font      = _FONT_BOLD
-        lbl_rec.Location  = Drawing.Point(580, 22)
-        lbl_rec.AutoSize  = True
-        panel.Controls.Add(lbl_rec)
-
-        self._chk_results = WinForms.CheckBox()
-        self._chk_results.Text     = "Include result files (.rst, .db, etc.)"
-        self._chk_results.Location = Drawing.Point(34, 44)
-        self._chk_results.Size     = Drawing.Size(280, 20)
-        self._chk_results.Checked  = False
-        panel.Controls.Add(self._chk_results)
-
-        self._rb_copy = WinForms.RadioButton()
-        self._rb_copy.Text     = "Copy .wbpj + _files folder  (no compression, largest)"
-        self._rb_copy.Location = Drawing.Point(12, 70)
-        self._rb_copy.Size     = Drawing.Size(500, 20)
-        panel.Controls.Add(self._rb_copy)
-
-        return panel
-
     def _populate_list(self):
         self._lv.Items.Clear()
         for c in self._candidates:
             item   = WinForms.ListViewItem(c["section_label"])
             status = c["archive_status"]
-
-            if status == repo.ARCH_STATUS_MISSING:
+            if repo.ARCH_STATUS_MISSING in status and not c.get("archive_path", ""):
                 item.ForeColor = _CLR_MISSING
-            elif status == repo.ARCH_STATUS_OK:
+            elif repo.ARCH_STATUS_OK in status:
                 item.ForeColor = _CLR_ARCHIVED_OK
-            elif status == repo.ARCH_STATUS_OUTDATED:
+            elif repo.ARCH_STATUS_OUTDATED in status:
                 item.ForeColor = _CLR_ARCHIVED_OLD
-
             item.SubItems.Add(c["label"])
             item.SubItems.Add(c["source_path"])
-
-            if c["is_wbpj"]:
-                sz_bytes = c["wbpj_total_size_bytes"]
-                sz_str   = c["wbpj_total_size_str"]
-            else:
-                sz_bytes = c["source_size_bytes"]
-                sz_str   = c["source_size_str"]
-
-            if sz_bytes > SIZE_WARN_BYTES:
-                sz_str += u"  \u26A0"
-
-            item.SubItems.Add(sz_str)
+            sz_b = c["wbpj_total_size_bytes"] if c["is_wbpj"] else c["source_size_bytes"]
+            sz_s = c["wbpj_total_size_str"]   if c["is_wbpj"] else c["source_size_str"]
+            if sz_b > SIZE_WARN_BYTES:
+                sz_s += u"  \u26A0"
+            item.SubItems.Add(sz_s)
             item.SubItems.Add(status)
-            item.Checked = (status != repo.ARCH_STATUS_OK)
+            item.Checked = (repo.ARCH_STATUS_OK not in status)
             self._lv.Items.Add(item)
 
     def _check_all(self, s, e):
@@ -1061,13 +1082,16 @@ class ArchiveDialog(WinForms.Form):
             self._lv.Items[i].Checked = False
 
     def _get_wbpj_method(self):
-        if self._wbpj_panel is None:
+        if self._rb_zip is None:
             return self.WBPJ_SKIP
         if self._rb_zip.Checked:
             return self.WBPJ_ZIP
         if self._rb_copy.Checked:
             return self.WBPJ_COPY_WITH_FILES
         return self.WBPJ_SKIP
+
+    def _inc_results(self):
+        return self._chk_results is not None and self._chk_results.Checked
 
     def _cancel(self):
         self.DialogResult = WinForms.DialogResult.Cancel
@@ -1077,27 +1101,23 @@ class ArchiveDialog(WinForms.Form):
         checked = [self._candidates[i]
                    for i in range(self._lv.Items.Count)
                    if self._lv.Items[i].Checked]
-
         if not checked:
-            WinForms.MessageBox.Show(
-                "No files are checked. Select at least one file to archive.",
-                "Nothing Selected")
+            WinForms.MessageBox.Show("No files checked.", "Nothing Selected")
             return
 
         wbpj_method = self._get_wbpj_method()
+        inc_results = self._inc_results()
 
         large = [c for c in checked
                  if (c["wbpj_total_size_bytes"] if c["is_wbpj"]
                      else c["source_size_bytes"]) > SIZE_WARN_BYTES]
         if large:
             names = "\n".join(u"  \u2022 " + c["label"] for c in large)
-            res = WinForms.MessageBox.Show(
-                u"The following files are larger than 1 GB:\n\n{0}\n\n"
-                u"This may take several minutes. Continue?".format(names),
-                u"Large File Warning",
-                WinForms.MessageBoxButtons.YesNo,
-                WinForms.MessageBoxIcon.Warning)
-            if res != WinForms.DialogResult.Yes:
+            if WinForms.MessageBox.Show(
+                    u"Files larger than 1 GB:\n\n{0}\n\nContinue?".format(names),
+                    u"Large File Warning",
+                    WinForms.MessageBoxButtons.YesNo,
+                    WinForms.MessageBoxIcon.Warning) != WinForms.DialogResult.Yes:
                 return
 
         successes = []
@@ -1114,38 +1134,53 @@ class ArchiveDialog(WinForms.Form):
                 if c["is_wbpj"]:
                     if wbpj_method == self.WBPJ_ZIP:
                         prog = ArchiveProgressDialog(
-                            u"Compressing: {0}".format(label))
+                            u"Compressing: {0}".format(label),
+                            owner=self._owner)
                         prog.Show()
                         WinForms.Application.DoEvents()
 
-                        def _zip_cb(fname):
-                            prog.set_status(u"Adding: {0}".format(fname))
+                        def _zip_cb(fname, cur, tot):
+                            prog.set_progress(cur, tot, fname)
 
                         dest_path = repo.zip_wbpj_with_files(
                             src, dest_dir,
-                            include_results=self._chk_results.Checked,
+                            include_results=inc_results,
                             progress_callback=_zip_cb)
                         prog.finish_success()
                         method = "zip"
 
                     elif wbpj_method == self.WBPJ_COPY_WITH_FILES:
+                        is_rearchive = bool(c.get("archive_path", ""))
+                        lbl_txt = u"Re-copying" if is_rearchive else u"Copying"
                         prog = ArchiveProgressDialog(
-                            u"Copying: {0}".format(label))
+                            u"{0}: {1}".format(lbl_txt, label),
+                            owner=self._owner)
                         prog.Show()
-                        prog.set_status(u"Copying .wbpj + _files folder...")
                         WinForms.Application.DoEvents()
-                        dest_path = repo.copy_wbpj_with_files(src, dest_dir)
+
+                        def _copy_cb(fname):
+                            prog.set_status(u"Copying: {0}".format(fname))
+
+                        if is_rearchive:
+                            dest_path = repo.copy_wbpj_with_files_delta(
+                                src, dest_dir,
+                                include_results=inc_results,
+                                progress_callback=_copy_cb)
+                        else:
+                            dest_path = repo.copy_wbpj_with_files(
+                                src, dest_dir,
+                                include_results=inc_results,
+                                progress_callback=_copy_cb)
                         prog.finish_success()
                         method = "copy_with_files"
-
                     else:
                         continue
-
                 else:
                     prog = ArchiveProgressDialog(
                         u"Copying: {0}  ({1})".format(
-                            label,
-                            repo.format_size(c.get("source_size_bytes", 0))))
+                            label, repo.format_size(
+                                c.get("source_size_bytes", 0))),
+                        owner=self._owner)
                     prog.Show()
                     prog.set_status(u"Copying to archive folder...")
                     WinForms.Application.DoEvents()
@@ -1159,23 +1194,22 @@ class ArchiveDialog(WinForms.Form):
 
             except Exception as exc:
                 failures.append("{0}: {1}".format(label, str(exc)))
-                _log("Archive failed [{0}]: {1}".format(label, str(exc)))
+                _log("Archive failed [{0}]: {1}".format(
+                    label, traceback.format_exc()))
 
         msg_parts = []
         if successes:
-            msg_parts.append(
-                u"\u2714 Archived successfully ({0}):\n{1}".format(
-                    len(successes),
-                    "\n".join(u"  \u2022 " + s for s in successes)))
+            msg_parts.append(u"\u2714 Archived ({0}):\n{1}".format(
+                len(successes),
+                "\n".join(u"  \u2022 " + s for s in successes)))
         if failures:
-            msg_parts.append(
-                u"\u2718 Failed ({0}):\n{1}".format(
-                    len(failures),
-                    "\n".join(u"  \u2022 " + f for f in failures)))
+            msg_parts.append(u"\u2718 Failed ({0}):\n{1}".format(
+                len(failures),
+                "\n".join(u"  \u2022 " + f for f in failures)))
 
         WinForms.MessageBox.Show(
-            "\n\n".join(msg_parts) if msg_parts else "No files were processed.",
-            "Archive Complete" if not failures else "Archive — Partial Success",
+            "\n\n".join(msg_parts) if msg_parts else "No files processed.",
+            "Archive Complete" if not failures else "Archive -- Partial",
             WinForms.MessageBoxButtons.OK,
             WinForms.MessageBoxIcon.Information if not failures
             else WinForms.MessageBoxIcon.Warning)
@@ -1191,11 +1225,11 @@ class ArchiveDialog(WinForms.Form):
 
 class ProjectInfoPanel(WinForms.Panel):
     def __init__(self, form_ref):
-        self._form          = form_ref
-        self._expanded      = True
-        self._suppress_evt  = False
-        self.BackColor      = Drawing.Color.FromArgb(245, 248, 252)
-        self.BorderStyle    = WinForms.BorderStyle.FixedSingle
+        self._form         = form_ref
+        self._expanded     = True
+        self._suppress_evt = False
+        self.BackColor     = Drawing.Color.FromArgb(245, 248, 252)
+        self.BorderStyle   = WinForms.BorderStyle.FixedSingle
         self._build_ui()
         self._load_values()
 
@@ -1285,10 +1319,8 @@ class ProjectInfoPanel(WinForms.Panel):
             status = info.get("status", "Active")
             items  = [self._cb_status.Items[i]
                       for i in range(self._cb_status.Items.Count)]
-            if status in items:
-                self._cb_status.SelectedItem = status
-            else:
-                self._cb_status.SelectedIndex = 0
+            self._cb_status.SelectedItem = (status if status in items
+                                            else items[0])
         except Exception as exc:
             _log("ProjectInfoPanel load error: " + str(exc))
         finally:
@@ -1303,7 +1335,6 @@ class ProjectInfoPanel(WinForms.Panel):
                 "status":   str(self._cb_status.SelectedItem or "Active"),
                 "revision": self._tb_rev.Text,
             })
-            _log("Project info saved")
         except Exception as exc:
             _log("Save error: " + str(exc))
             WinForms.MessageBox.Show("Save failed:\n" + str(exc), "Error")
@@ -1312,21 +1343,18 @@ class ProjectInfoPanel(WinForms.Panel):
         if self._suppress_evt:
             return
         try:
-            selected = str(self._cb_status.SelectedItem or "")
-            if selected != "Archived":
+            if str(self._cb_status.SelectedItem or "") != "Archived":
                 return
             self._save(None, None)
-            res = WinForms.MessageBox.Show(
-                u"You have set this project to \u2018Archived\u2019 status.\n\n"
-                u"Would you like to copy reference files into the project "
-                u"repository archive folders now?",
-                u"Archive Repository Files?",
-                WinForms.MessageBoxButtons.YesNo,
-                WinForms.MessageBoxIcon.Question)
-            if res == WinForms.DialogResult.Yes:
+            if WinForms.MessageBox.Show(
+                    u"Set to \u2018Archived\u2019. Archive files now?",
+                    "Archive?",
+                    WinForms.MessageBoxButtons.YesNo,
+                    WinForms.MessageBoxIcon.Question
+                    ) == WinForms.DialogResult.Yes:
                 self._form.launch_archive_dialog()
         except Exception as exc:
-            _log("Status change handler error: " + str(exc))
+            _log("Status change error: " + str(exc))
 
     def _log_revision(self, s, e):
         try:
@@ -1344,12 +1372,10 @@ class ProjectInfoPanel(WinForms.Panel):
     def _toggle(self, s, e):
         self._expanded = not self._expanded
         self._fields_panel.Visible = self._expanded
-        if self._expanded:
-            self.Size = Drawing.Size(1300, 106)
-            self._btn_toggle.Text = u"\u25B2 Collapse"
-        else:
-            self.Size = Drawing.Size(1300, 36)
-            self._btn_toggle.Text = u"\u25BC Expand"
+        self.Size = (Drawing.Size(1300, 106) if self._expanded
+                     else Drawing.Size(1300, 36))
+        self._btn_toggle.Text = (u"\u25B2 Collapse" if self._expanded
+                                 else u"\u25BC Expand")
         self._form.on_panel_resize()
 
 
@@ -1400,29 +1426,18 @@ class RepositoryForm(WinForms.Form):
         toolbar_y = 62
         toolbar_h = 42
         x = 16
-
-        self.Controls.Add(_make_btn(u"\u2795  Add File(s)...", x, toolbar_y,
-                                    160, toolbar_h, primary=True,
-                                    handler=self._on_add))
-        x += 168
-        self.Controls.Add(_make_btn(u"\u21BA  Refresh", x, toolbar_y,
-                                    110, toolbar_h, handler=self._refresh_all))
-        x += 118
-        self.Controls.Add(_make_btn(u"\u25B6  Open", x, toolbar_y,
-                                    100, toolbar_h, handler=self._on_open))
-        x += 108
-        self.Controls.Add(_make_btn(u"\u2716  Remove", x, toolbar_y,
-                                    110, toolbar_h, handler=self._on_remove))
-        x += 118
-        self.Controls.Add(_make_btn(u"\u270E  Notes", x, toolbar_y,
-                                    100, toolbar_h, handler=self._on_notes))
-        x += 108
-        self.Controls.Add(_make_btn(u"\u2764  Health Check", x, toolbar_y,
-                                    140, toolbar_h,
-                                    handler=self._on_health_check))
-        x += 148
-        self.Controls.Add(_make_btn(u"\U0001F4E6  Archive Files", x, toolbar_y,
-                                    150, toolbar_h, handler=self._on_archive))
+        for text, w, primary, handler in [
+            (u"\u2795  Add File(s)...",   160, True,  self._on_add),
+            (u"\u21BA  Refresh",          110, False, self._refresh_all),
+            (u"\u25B6  Open",             100, False, self._on_open),
+            (u"\u2716  Remove",           110, False, self._on_remove),
+            (u"\u270E  Notes",            100, False, self._on_notes),
+            (u"\u2764  Health Check",     140, False, self._on_health_check),
+            (u"\U0001F4E6  Archive",      120, False, self._on_archive),
+        ]:
+            self.Controls.Add(_make_btn(text, x, toolbar_y, w, toolbar_h,
+                                        primary=primary, handler=handler))
+            x += w + 8
 
         sep = WinForms.Label()
         sep.BorderStyle = WinForms.BorderStyle.Fixed3D
@@ -1455,7 +1470,6 @@ class RepositoryForm(WinForms.Form):
             tab.Text      = repo.SECTION_LABELS[sec]
             tab.Padding   = WinForms.Padding(4)
             tab.BackColor = Drawing.Color.White
-
             lv = self._make_listview(sec)
             lv.Anchor   = (WinForms.AnchorStyles.Top    |
                            WinForms.AnchorStyles.Bottom |
@@ -1463,7 +1477,6 @@ class RepositoryForm(WinForms.Form):
                            WinForms.AnchorStyles.Right)
             lv.Location = Drawing.Point(0, 0)
             lv.Size     = Drawing.Size(tab.Width, tab.Height)
-
             tab.Controls.Add(lv)
             self._tabs.TabPages.Add(tab)
             self._listviews[sec] = lv
@@ -1488,25 +1501,23 @@ class RepositoryForm(WinForms.Form):
         lv.Font           = _FONT_BOLD
         lv.HeaderStyle    = WinForms.ColumnHeaderStyle.Clickable
         lv.Tag            = section
-
-        for name, w in [("File Name",  380), ("Status",    90),
+        for name, w in [("File Name",  380), ("Status",    120),
                         ("Size (MB)",   90), ("Modified", 150),
-                        ("Date Added", 150), ("Notes",    250),
-                        ("Full Path",  400)]:
+                        ("Date Added", 150), ("Notes",    230),
+                        ("Full Path",  380)]:
             lv.Columns.Add(name, w)
-
         lv.ColumnClick  += self._on_column_click
         lv.DoubleClick  += self._on_double_click
         lv.MouseUp      += self._on_list_mouse_up
         return lv
 
-    # ── Tab drawing ───────────────────────────────────────────────────────
-
     def _on_draw_tab(self, s, e):
         try:
             is_active = (e.Index == self._tabs.SelectedIndex)
-            bg   = _CLR_ANSYS_BLUE if is_active else Drawing.Color.FromArgb(240, 240, 240)
-            fg   = Drawing.Color.White if is_active else Drawing.Color.FromArgb(100, 100, 100)
+            bg   = (_CLR_ANSYS_BLUE if is_active
+                    else Drawing.Color.FromArgb(240, 240, 240))
+            fg   = (Drawing.Color.White if is_active
+                    else Drawing.Color.FromArgb(100, 100, 100))
             font = _FONT_BOLD if is_active else _FONT_NORMAL
             e.Graphics.FillRectangle(Drawing.SolidBrush(bg), e.Bounds)
             fmt = Drawing.StringFormat()
@@ -1517,10 +1528,8 @@ class RepositoryForm(WinForms.Form):
                 Drawing.SolidBrush(fg),
                 Drawing.RectangleF(e.Bounds.X, e.Bounds.Y,
                                    e.Bounds.Width, e.Bounds.Height), fmt)
-        except Exception as exc:
-            _log("Tab draw error: " + str(exc))
-
-    # ── Layout ────────────────────────────────────────────────────────────
+        except Exception:
+            pass
 
     def on_panel_resize(self):
         self._info_panel_bottom = (self._info_panel.Top +
@@ -1531,21 +1540,17 @@ class RepositoryForm(WinForms.Form):
         self._do_layout()
 
     def _do_layout(self):
-        sb_h  = self._status_bar.Height
-        top   = self._info_panel_bottom
-        avail = self.ClientSize.Height - top - sb_h - 4
-        if avail < 100:
-            avail = 100
-        self._tabs.Location = Drawing.Point(16, top)
-        self._tabs.Size     = Drawing.Size(self.ClientSize.Width - 32, avail)
+        avail = (self.ClientSize.Height - self._info_panel_bottom -
+                 self._status_bar.Height - 4)
+        self._tabs.Location = Drawing.Point(16, self._info_panel_bottom)
+        self._tabs.Size     = Drawing.Size(self.ClientSize.Width - 32,
+                                           max(avail, 100))
 
     def _on_tab_changed(self, s, e):
         idx = self._tabs.SelectedIndex
         if 0 <= idx < len(repo.ALL_SECTIONS):
             self._cur_section = repo.ALL_SECTIONS[idx]
         self._tabs.Invalidate()
-
-    # ── Column sort ───────────────────────────────────────────────────────
 
     def _on_column_click(self, s, e):
         try:
@@ -1569,17 +1574,14 @@ class RepositoryForm(WinForms.Form):
         col = st["col"]
         asc = st["asc"]
         key_map = {
-            COL_FILENAME:  "label",
-            COL_STATUS:    "status",
-            COL_SIZE:      "size_mb",
-            COL_MODIFIED:  "modified",
-            COL_DATEADDED: "date_added",
-            COL_NOTES:     "notes",
-            COL_FULLPATH:  "source_path",
+            COL_FILENAME: "label", COL_STATUS: "status",
+            COL_SIZE: "size_mb",   COL_MODIFIED: "modified",
+            COL_DATEADDED: "date_added", COL_NOTES: "notes",
+            COL_FULLPATH: "source_path",
         }
         key = key_map.get(col, "label")
 
-        def sort_key(r):
+        def sk(r):
             val = r.get(key, "") or ""
             if col == COL_SIZE:
                 try:
@@ -1588,11 +1590,8 @@ class RepositoryForm(WinForms.Form):
                     return 0.0
             return val.lower()
 
-        self._section_data[section] = sorted(
-            records, key=sort_key, reverse=not asc)
+        self._section_data[section] = sorted(records, key=sk, reverse=not asc)
         self._populate_listview(section, self._section_data[section])
-
-    # ── Data / population ─────────────────────────────────────────────────
 
     def _refresh_all(self, sender, e):
         try:
@@ -1617,7 +1616,6 @@ class RepositoryForm(WinForms.Form):
                 sel_paths.add(item.SubItems[COL_FULLPATH].Text)
             except Exception:
                 pass
-
         lv.Items.Clear()
         for r in records:
             item   = lv.Items.Add(r.get("label", "Unnamed"))
@@ -1630,15 +1628,22 @@ class RepositoryForm(WinForms.Form):
             path = r.get("source_path", "")
             item.SubItems.Add(path)
 
-            if status == repo.ARCH_STATUS_MISSING:
+            arch_abs = r.get("archive_path_abs", "")
+            truly_missing = (repo.ARCH_STATUS_MISSING in status and
+                             not arch_abs)
+
+            if truly_missing:
                 item.ForeColor = _CLR_MISSING
                 item.Font      = _FONT_BOLD
-            elif status == repo.ARCH_STATUS_OK:
+            elif repo.ARCH_STATUS_OK in status:
                 item.ForeColor = _CLR_ARCHIVED_OK
                 item.Font      = _FONT_NORMAL
-            elif status == repo.ARCH_STATUS_OUTDATED:
+            elif repo.ARCH_STATUS_OUTDATED in status:
                 item.ForeColor = _CLR_ARCHIVED_OLD
                 item.Font      = _FONT_BOLD
+            elif repo.ARCH_STATUS_UNARCHIVED in status:
+                item.ForeColor = _CLR_UNARCHIVED
+                item.Font      = _FONT_NORMAL
             else:
                 item.ForeColor = Drawing.Color.Black
                 item.Font      = _FONT_NORMAL
@@ -1651,19 +1656,16 @@ class RepositoryForm(WinForms.Form):
             records = self._section_data.get(sec, [])
             total   = len(records)
             missing = sum(1 for r in records
-                          if r.get("status") == repo.ARCH_STATUS_MISSING)
-            base    = repo.SECTION_LABELS[sec]
-            if missing > 0:
-                self._tabs.TabPages[i].Text = (
-                    u"{0}  [{1}  \u2718{2}]".format(base, total, missing))
-            else:
-                self._tabs.TabPages[i].Text = (
-                    u"{0}  [{1}]".format(base, total))
+                          if (repo.ARCH_STATUS_MISSING in r.get("status", "") and
+                              not r.get("archive_path_abs", "")))
+            base = repo.SECTION_LABELS[sec]
+            self._tabs.TabPages[i].Text = (
+                u"{0}  [{1}  \u2718{2}]".format(base, total, missing)
+                if missing > 0 else
+                u"{0}  [{1}]".format(base, total))
 
     def _set_status(self, msg):
         self._status_lbl.Text = msg
-
-    # ── Selection helpers ─────────────────────────────────────────────────
 
     def _current_lv(self):
         return self._listviews.get(self._cur_section)
@@ -1677,8 +1679,6 @@ class RepositoryForm(WinForms.Form):
             if 0 <= idx < len(records):
                 result.append((idx, records[idx]))
         return result
-
-    # ── Right-click context menu ──────────────────────────────────────────
 
     def _on_list_mouse_up(self, s, e):
         if e.Button != WinForms.MouseButtons.Right:
@@ -1696,19 +1696,38 @@ class RepositoryForm(WinForms.Form):
             idx     = hit.Item.Index
             if idx < 0 or idx >= len(records):
                 return
-            record  = records[idx]
-            status  = record.get("status", "")
-            missing  = (status == repo.ARCH_STATUS_MISSING)
-            outdated = (status == repo.ARCH_STATUS_OUTDATED)
+            record   = records[idx]
+            status   = record.get("status", "")
+            arch_abs = record.get("archive_path_abs", "")
+            missing  = (repo.ARCH_STATUS_MISSING in status and not arch_abs)
+            outdated = repo.ARCH_STATUS_OUTDATED in status
+            src_path = record.get("source_path", "")
 
             menu = WinForms.ContextMenuStrip()
 
             item_open = menu.Items.Add(u"\u25B6  Open")
-            item_open.Enabled = not (missing and not record.get("archive_path", ""))
+            item_open.Enabled = not (missing and not arch_abs)
             item_open.Click  += lambda s2, e2: self._on_open(None, None)
 
             item_notes = menu.Items.Add(u"\u270E  Edit Notes")
             item_notes.Click += lambda s2, e2: self._on_notes(None, None)
+
+            menu.Items.Add(WinForms.ToolStripSeparator())
+
+            # Open directories
+            ref_dir = os.path.dirname(src_path) if src_path else ""
+            item_ref = menu.Items.Add(u"\U0001F4C2  Open Reference Directory")
+            item_ref.Enabled = bool(ref_dir) and os.path.isdir(ref_dir)
+            _ref = ref_dir
+            item_ref.Click += lambda s2, e2, d=_ref: (
+                os.startfile(d) if d and os.path.isdir(d) else None)
+
+            rep_dir = os.path.dirname(arch_abs) if arch_abs else ""
+            item_rep = menu.Items.Add(u"\U0001F4C2  Open Repository Directory")
+            item_rep.Enabled = bool(rep_dir) and os.path.isdir(rep_dir)
+            _rep = rep_dir
+            item_rep.Click += lambda s2, e2, d=_rep: (
+                os.startfile(d) if d and os.path.isdir(d) else None)
 
             menu.Items.Add(WinForms.ToolStripSeparator())
 
@@ -1731,8 +1750,6 @@ class RepositoryForm(WinForms.Form):
         except Exception as exc:
             _log("Context menu error: " + str(exc))
 
-    # ── Smart open  (context-aware) ───────────────────────────────────────
-
     def _on_open(self, sender, e):
         try:
             sel = self._selected_records()
@@ -1746,22 +1763,12 @@ class RepositoryForm(WinForms.Form):
             WinForms.MessageBox.Show("Open failed:\n" + str(exc), "Error")
 
     def _open_record(self, section, index, record):
-        """
-        Context-aware open logic.
-
-        1. Prune stale source_path / local_extract_path on this machine.
-        2. Determine mode via repo.get_open_target().
-        3. Route to appropriate dialog or direct open.
-        """
-        # Step 1 — prune stale paths (silent, updates manifest if needed)
         repo.prune_stale_fields(section, index)
-        # Reload the record after potential pruning
         data    = repo.load_manifest()
         records = data["sections"].get(section, [])
         if index < 0 or index >= len(records):
             return
         record = records[index]
-
         target = repo.get_open_target(record)
         mode   = target["mode"]
         _log("Open mode: {0}  label={1}".format(mode, record.get("label", "")))
@@ -1769,121 +1776,96 @@ class RepositoryForm(WinForms.Form):
         if mode == "none":
             WinForms.MessageBox.Show(
                 "No accessible file found.\n\n"
-                "The source reference path does not exist on this machine\n"
-                "and no archive copy is available.",
-                "Cannot Open")
-            return
-
+                "Source path does not exist on this machine "
+                "and no archive copy is available.", "Cannot Open")
         elif mode == "source":
-            # No archive — open source directly
             _smart_open_file(target["source_path"])
-
         elif mode == "archive_direct":
-            # Non-ZIP archive — offer choice if source also available
             if target["has_source"]:
                 dlg = OpenChoiceDialog(record)
                 if dlg.ShowDialog() == WinForms.DialogResult.OK and dlg.open_path:
                     _smart_open_file(dlg.open_path)
             else:
-                # Only archive available — open it directly
                 _smart_open_file(target["archive_path"])
-
         elif mode == "extract_first":
-            # ZIP archive, not yet extracted on this machine
             self._extract_and_open(section, index, record,
                                    target["archive_path"])
-
         elif mode == "archive_zip":
-            # ZIP archive, previously extracted
             dlg = ZipOpenDialog(
                 target["archive_path"],
                 target["extract_path"],
-                record.get("label", ""))
-
+                record.get("label", ""),
+                source_path=(target["source_path"]
+                             if target["has_source"] else ""))
             if dlg.ShowDialog() != WinForms.DialogResult.OK:
                 return
-
-            if dlg.action == ZipOpenDialog.OPEN_EXISTING:
+            if dlg.action == ZipOpenDialog.OPEN_SOURCE:
+                _smart_open_file(target["source_path"])
+            elif dlg.action == ZipOpenDialog.OPEN_EXISTING:
                 _smart_open_file(target["extract_path"])
-
             elif dlg.action == ZipOpenDialog.RE_EXTRACT:
-                # Re-extract to same directory
+                # Re-extract flat to same directory as existing extract
                 extract_dir = os.path.dirname(target["extract_path"])
                 self._do_extract(section, index, target["archive_path"],
                                  extract_dir)
-
             elif dlg.action == ZipOpenDialog.OTHER_LOCATION:
                 self._extract_and_open(section, index, record,
                                        target["archive_path"])
 
     def _extract_and_open(self, section, index, record, zip_path):
-        """Show ZipExtractDialog, extract, open, save path, offer to set as source."""
         dlg = ZipExtractDialog(zip_path, record.get("label", ""))
         if dlg.ShowDialog() != WinForms.DialogResult.OK:
             return
         self._do_extract(section, index, zip_path, dlg.chosen_dest)
 
     def _do_extract(self, section, index, zip_path, dest_dir):
-        """Extract the ZIP, open the .wbpj, save local_extract_path, offer source update."""
+        """Extract flat into dest_dir, open .wbpj, offer to set as source."""
         prog = ArchiveProgressDialog(
-            u"Extracting: {0}".format(os.path.basename(zip_path)))
+            u"Extracting: {0}".format(os.path.basename(zip_path)),
+            owner=self)
         prog.Show()
         WinForms.Application.DoEvents()
 
         try:
-            def _cb(fname):
-                prog.set_status(u"Extracting: {0}".format(fname))
+            def _cb(fname, cur, tot):
+                prog.set_progress(cur, tot, fname)
 
             extracted_wbpj = repo.zip_extract_to(zip_path, dest_dir,
                                                   progress_callback=_cb)
             prog.finish_success()
         except Exception as exc:
-            prog.finish_success()
+            try:
+                prog.finish_success()
+            except Exception:
+                pass
             _log("Extraction error: " + str(exc))
-            WinForms.MessageBox.Show(
-                "Extraction failed:\n" + str(exc), "Extract Error")
+            WinForms.MessageBox.Show("Extraction failed:\n" + str(exc), "Error")
             return
 
-        # Save local_extract_path
         if extracted_wbpj and extracted_wbpj.lower().endswith(".wbpj"):
             repo.update_local_extract(section, index, extracted_wbpj)
-            _log("Saved local_extract_path: " + extracted_wbpj)
-
-            # Open it
             _smart_open_file(extracted_wbpj)
-
-            # Offer to designate as working source
             res = WinForms.MessageBox.Show(
-                u"The archive was extracted to:\n{0}\n\n"
-                u"Would you like to set this extracted copy as your working "
-                u"source for future re-archiving?\n\n"
-                u"Yes  \u2014 Future re-archives will compress this copy.\n"
-                u"No   \u2014  Keep original source reference (if it exists).".format(
+                u"Extracted to:\n{0}\n\n"
+                u"Set this as your working source for future re-archiving?\n\n"
+                u"Yes -- re-archives will compress this copy.\n"
+                u"No  -- keep original source reference.".format(
                     extracted_wbpj),
                 u"Set as Working Source?",
                 WinForms.MessageBoxButtons.YesNo,
                 WinForms.MessageBoxIcon.Question)
-
             if res == WinForms.DialogResult.Yes:
                 repo.update_source_path(section, index, extracted_wbpj)
-                _log("source_path updated to extracted copy: " + extracted_wbpj)
-
             self._refresh_all(None, None)
         else:
-            prog.finish_success()
-            # No .wbpj found — just open the dest_dir in Explorer
             try:
                 os.startfile(dest_dir)
             except Exception:
                 WinForms.MessageBox.Show(
-                    u"Extraction complete but no .wbpj found at root.\n"
-                    u"Extracted to: " + dest_dir,
-                    "Extraction Complete")
+                    u"Extraction complete.\nExtracted to: " + dest_dir, "Done")
 
     def _on_double_click(self, sender, e):
         self._on_open(sender, e)
-
-    # ── Archive launcher ──────────────────────────────────────────────────
 
     def launch_archive_dialog(self):
         try:
@@ -1891,27 +1873,20 @@ class RepositoryForm(WinForms.Form):
             candidates = repo.get_archive_candidates(open_proj)
             if not candidates:
                 WinForms.MessageBox.Show(
-                    "No eligible files found to archive.\n\n"
-                    "Add files to the repository first.\n\n"
-                    "Note: the currently open project is automatically excluded.",
+                    "No eligible files found.\n\n"
+                    "Add files first. The currently open project is excluded.",
                     "Nothing to Archive")
                 return
-            dlg = ArchiveDialog(candidates, open_proj)
+            dlg = ArchiveDialog(candidates, open_proj, owner=self)
             if dlg.ShowDialog() == WinForms.DialogResult.OK:
                 self._refresh_all(None, None)
-                archived = dlg._archived_results
-                if archived:
+                if dlg._archived_results:
                     self._set_status(
-                        u"Archived {0} file(s): {1}".format(
-                            len(archived),
-                            ", ".join(archived[:3]) +
-                            ("..." if len(archived) > 3 else "")))
+                        u"Archived {0} file(s)".format(
+                            len(dlg._archived_results)))
         except Exception as exc:
             _log("launch_archive_dialog error: " + traceback.format_exc())
-            WinForms.MessageBox.Show(
-                "Archive dialog error:\n" + str(exc), "Error")
-
-    # ── Re-archive single outdated file ───────────────────────────────────
+            WinForms.MessageBox.Show("Archive error:\n" + str(exc), "Error")
 
     def _on_rearchive(self, section, index):
         try:
@@ -1925,20 +1900,19 @@ class RepositoryForm(WinForms.Form):
 
             if not src or not os.path.exists(src):
                 WinForms.MessageBox.Show(
-                    "Source file not found. Use Relink to locate it first.",
-                    "Re-archive Error")
+                    "Source file not found. Use Relink first.", "Error")
                 return
 
             dest_dir = repo.get_section_archive_dir(section)
 
             if method == "zip":
                 prog = ArchiveProgressDialog(
-                    u"Re-compressing: {0}".format(label))
+                    u"Re-compressing: {0}".format(label), owner=self)
                 prog.Show()
                 WinForms.Application.DoEvents()
 
-                def _cb(fname):
-                    prog.set_status(u"Adding: {0}".format(fname))
+                def _cb(fname, cur, tot):
+                    prog.set_progress(cur, tot, fname)
 
                 dest_path = repo.zip_wbpj_with_files(
                     src, dest_dir, progress_callback=_cb)
@@ -1947,18 +1921,23 @@ class RepositoryForm(WinForms.Form):
 
             elif method == "copy_with_files":
                 prog = ArchiveProgressDialog(
-                    u"Re-copying: {0}".format(label))
+                    u"Re-copying (delta): {0}".format(label), owner=self)
                 prog.Show()
-                prog.set_status(u"Copying .wbpj + _files folder...")
                 WinForms.Application.DoEvents()
-                dest_path = repo.copy_wbpj_with_files(src, dest_dir)
+
+                def _cb2(fname):
+                    prog.set_status(u"Copying: {0}".format(fname))
+
+                dest_path = repo.copy_wbpj_with_files_delta(
+                    src, dest_dir, progress_callback=_cb2)
                 prog.finish_success()
                 repo.update_archive_record(section, index, dest_path,
                                            "copy_with_files")
             else:
-                prog = ArchiveProgressDialog(u"Re-copying: {0}".format(label))
+                prog = ArchiveProgressDialog(
+                    u"Re-copying: {0}".format(label), owner=self)
                 prog.Show()
-                prog.set_status(u"Copying file...")
+                prog.set_status("Copying...")
                 WinForms.Application.DoEvents()
                 dest_path = repo.archive_regular_file(src, dest_dir)
                 prog.finish_success()
@@ -1971,17 +1950,13 @@ class RepositoryForm(WinForms.Form):
             _log("Re-archive error: " + str(exc))
             WinForms.MessageBox.Show("Re-archive failed:\n" + str(exc), "Error")
 
-    # ── Relink ────────────────────────────────────────────────────────────
-
     def _on_relink(self, section, index):
         try:
-            records = self._section_data.get(section, [])
+            records  = self._section_data.get(section, [])
             if index < 0 or index >= len(records):
                 return
-            record   = records[index]
-            old_path = record.get("source_path", "")
+            old_path = records[index].get("source_path", "")
             old_name = os.path.basename(old_path) if old_path else ""
-
             dlg = WinForms.OpenFileDialog()
             dlg.Title    = u"Relink: locate \"{0}\"".format(old_name)
             dlg.Filter   = "All Files (*.*)|*.*"
@@ -1990,13 +1965,11 @@ class RepositoryForm(WinForms.Form):
                 return
             repo.relink_file_record(section, index, dlg.FileName)
             self._refresh_all(None, None)
-            self._set_status(u"Relinked: {0}".format(
-                os.path.basename(dlg.FileName)))
+            self._set_status(
+                u"Relinked: {0}".format(os.path.basename(dlg.FileName)))
         except Exception as exc:
             _log("Relink error: " + str(exc))
             WinForms.MessageBox.Show("Relink failed:\n" + str(exc), "Error")
-
-    # ── Toolbar handlers ──────────────────────────────────────────────────
 
     def _on_add(self, sender, e):
         try:
@@ -2018,8 +1991,7 @@ class RepositoryForm(WinForms.Form):
                         skipped += 1
                 self._refresh_all(None, None)
                 self._set_status(
-                    u"Added {0} file(s). {1} duplicate(s) skipped.".format(
-                        added, skipped))
+                    u"Added {0} file(s). {1} skipped.".format(added, skipped))
         except Exception as exc:
             _log("Add error: " + traceback.format_exc())
             WinForms.MessageBox.Show("Add failed:\n" + str(exc), "Error")
@@ -2031,14 +2003,27 @@ class RepositoryForm(WinForms.Form):
                 return
             names = "\n".join(r.get("label", "?") for _, r in sel)
             if WinForms.MessageBox.Show(
-                    "Remove {0} file(s) from the repository?\n\n{1}".format(
-                        len(sel), names),
+                    "Remove {0} file(s)?\n\n{1}".format(len(sel), names),
                     "Confirm Remove",
                     WinForms.MessageBoxButtons.YesNo
                     ) != WinForms.DialogResult.Yes:
                 return
-            for idx, _ in sorted(sel, key=lambda t: t[0], reverse=True):
-                repo.remove_file_record(self._cur_section, idx)
+
+            for idx, record in sorted(sel, key=lambda t: t[0], reverse=True):
+                arch_abs = record.get("archive_path_abs", "")
+                if arch_abs and os.path.exists(arch_abs):
+                    res = WinForms.MessageBox.Show(
+                        u"Also delete the archived copy from the repository?\n\n"
+                        u"{0}".format(arch_abs),
+                        u"Delete Archive Copy?",
+                        WinForms.MessageBoxButtons.YesNo,
+                        WinForms.MessageBoxIcon.Question)
+                    removed = repo.remove_file_record(self._cur_section, idx)
+                    if removed and res == WinForms.DialogResult.Yes:
+                        repo.delete_archive_file(removed)
+                else:
+                    repo.remove_file_record(self._cur_section, idx)
+
             self._refresh_all(None, None)
         except Exception as exc:
             _log("Remove error: " + traceback.format_exc())
@@ -2062,13 +2047,12 @@ class RepositoryForm(WinForms.Form):
         try:
             self._set_status("Running health check...")
             health = repo.run_health_check()
-            HealthCheckDialog(health).ShowDialog()
+            HealthCheckDialog(health, owner_form=self).ShowDialog()
             self._refresh_all(None, None)
             self._set_status("Health check complete.")
         except Exception as exc:
             _log("Health check error: " + str(exc))
-            WinForms.MessageBox.Show(
-                "Health check failed:\n" + str(exc), "Error")
+            WinForms.MessageBox.Show("Health check failed:\n" + str(exc), "Error")
 
     def _on_archive(self, sender, e):
         self.launch_archive_dialog()
@@ -2082,27 +2066,22 @@ def _launch_repository_form(task=None):
     try:
         _log("=== Launching Repository Form ===")
         user_files_dir = _resolve_project_dir(task)
-
         if not user_files_dir:
             WinForms.MessageBox.Show(
                 "No saved Workbench project was found.\n\n"
-                "Please save your project first:\n"
-                u"    File  \u2192  Save As\u2026\n\n"
-                "Then click the Analysis Repository button again.",
+                u"Please save your project first (File \u2192 Save As\u2026)\n"
+                "then click the Analysis Repository button again.",
                 u"Analysis Hub \u2014 Save Project First",
                 WinForms.MessageBoxButtons.OK,
                 WinForms.MessageBoxIcon.Information)
             return
-
         repo.set_base_directory(user_files_dir)
         RepositoryForm(task).ShowDialog()
-
     except Exception as exc:
         _log("_launch_repository_form error:\n" + traceback.format_exc())
         try:
             WinForms.MessageBox.Show(
-                "Analysis Hub encountered an error:\n\n" + str(exc),
-                "Analysis Hub Error",
+                "Analysis Hub error:\n\n" + str(exc), "Error",
                 WinForms.MessageBoxButtons.OK,
                 WinForms.MessageBoxIcon.Error)
         except Exception:
@@ -2115,7 +2094,7 @@ def _launch_repository_form(task=None):
 
 def init(ext):
     try:
-        _log("Extension init: InstallDir = " + ext.InstallDir)
+        _log("init: InstallDir = " + ext.InstallDir)
         ext_subdir = os.path.join(ext.InstallDir, "AnalysisHub")
         if ext_subdir not in sys.path:
             sys.path.insert(0, ext_subdir)
@@ -2125,7 +2104,6 @@ def init(ext):
 
 def task_initialize(task):
     try:
-        _log("task_initialize: " + task.Name)
         task.Properties["ProjectTitle"].Value  = ""
         task.Properties["Customer"].Value      = ""
         task.Properties["Analyst"].Value       = ""
@@ -2140,7 +2118,6 @@ def task_initialize(task):
 
 def task_edit(task):
     try:
-        _log("task_edit called")
         _launch_repository_form(task)
         _sync_task_properties(task)
     except Exception as exc:
@@ -2149,7 +2126,6 @@ def task_edit(task):
 
 def task_update(task):
     try:
-        _log("task_update called")
         user_files_dir = _resolve_project_dir(task)
         if user_files_dir:
             repo.set_base_directory(user_files_dir)
@@ -2160,7 +2136,6 @@ def task_update(task):
 
 def task_refresh(task):
     try:
-        _log("task_refresh called")
         task_update(task)
     except Exception as exc:
         _log("task_refresh error: " + str(exc))
@@ -2174,18 +2149,16 @@ def task_status(task):
     try:
         user_files_dir = _resolve_project_dir(task)
         if not user_files_dir:
-            return ["Unfulfilled",
-                    "No project directory found - please save the project"]
+            return ["Unfulfilled", "No project directory - please save"]
         repo.set_base_directory(user_files_dir)
         total, missing = repo.get_summary_stats()
         if total == 0:
-            return ["Unfulfilled", "Repository is empty - add files to get started"]
+            return ["Unfulfilled", "Repository empty"]
         elif missing > 0:
             return ["Refresh Required",
-                    "{0} file(s) missing from repository".format(missing)]
+                    "{0} file(s) missing".format(missing)]
         else:
-            return ["UpToDate",
-                    "Repository OK - {0} file(s) tracked".format(total)]
+            return ["UpToDate", "Repository OK - {0} tracked".format(total)]
     except Exception as exc:
         _log("task_status error: " + str(exc))
         return ["UpToDate", "Repository"]
@@ -2193,7 +2166,6 @@ def task_status(task):
 
 def task_report(task, report):
     try:
-        _log("task_report called")
         total, missing = repo.get_summary_stats()
         info = repo.get_project_info()
         lines = [
@@ -2219,23 +2191,20 @@ def task_delete(task):
 
 def context_refresh(task):
     try:
-        _log("context_refresh called")
         user_files_dir = _resolve_project_dir(task)
         if user_files_dir:
             repo.set_base_directory(user_files_dir)
         _sync_task_properties(task)
         total, missing = repo.get_summary_stats()
         WinForms.MessageBox.Show(
-            u"Repository refreshed.\nTotal: {0}   Missing: {1}".format(
-                total, missing),
-            u"Analysis Hub \u2014 Refresh")
+            u"Refreshed.\nTotal: {0}   Missing: {1}".format(total, missing),
+            u"Analysis Hub")
     except Exception as exc:
         _log("context_refresh error: " + str(exc))
 
 
 def context_health_check(task):
     try:
-        _log("context_health_check called")
         user_files_dir = _resolve_project_dir(task)
         if user_files_dir:
             repo.set_base_directory(user_files_dir)
@@ -2249,7 +2218,7 @@ def toolbar_open_repository(task=None):
         _log("toolbar_open_repository called")
         _launch_repository_form(task)
     except Exception as exc:
-        _log("toolbar_open_repository error: " + str(exc))
+        _log("toolbar error: " + str(exc))
 
 
 def _sync_task_properties(task):
@@ -2260,12 +2229,10 @@ def _sync_task_properties(task):
         repo.set_base_directory(user_files_dir)
         total, missing = repo.get_summary_stats()
         info = repo.get_project_info()
-
         task.Properties["TotalFiles"].Value   = str(total)
         task.Properties["MissingFiles"].Value = str(missing)
         task.Properties["LastRefresh"].Value  = datetime.datetime.now().strftime(
             "%Y-%m-%d %H:%M")
-
         for field, prop in [("title",    "ProjectTitle"),
                              ("customer", "Customer"),
                              ("analyst",  "Analyst"),
