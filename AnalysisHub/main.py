@@ -1860,6 +1860,11 @@ class RepositoryForm(WinForms.Form):
             item_rearch.Enabled = outdated
             item_rearch.Click  += lambda s2, e2: self._on_rearchive(_sec, _idx)
 
+            # Fix 6: per-row "Archive this file..." -- opens ArchiveDialog
+            # pre-filtered to just this single record.
+            item_archive_one = menu.Items.Add(u"\U0001F4E6  Archive this file\u2026")
+            item_archive_one.Click += lambda s2, e2: self._on_archive_single(_sec, _idx)
+
             menu.Items.Add(WinForms.ToolStripSeparator())
 
             item_remove = menu.Items.Add(u"\u2716  Remove from Repository")
@@ -1928,10 +1933,12 @@ class RepositoryForm(WinForms.Form):
             elif dlg.action == ZipOpenDialog.OPEN_EXISTING:
                 _smart_open_file(target["extract_path"])
             elif dlg.action == ZipOpenDialog.RE_EXTRACT:
-                # Re-extract flat to same directory as existing extract
-                extract_dir = os.path.dirname(target["extract_path"])
+                # Re-extract to repository folder (alongside ZIP), NOT the
+                # previous extract location -- "Extract to repository folder"
+                # always targets the section archive directory.
+                repo_dir = os.path.dirname(target["archive_path"])
                 self._do_extract(section, index, target["archive_path"],
-                                 extract_dir)
+                                 repo_dir)
             elif dlg.action == ZipOpenDialog.OTHER_LOCATION:
                 # Use the folder the user browsed to inline in ZipOpenDialog
                 other_dest = getattr(dlg, "_other_dest", "")
@@ -1950,6 +1957,12 @@ class RepositoryForm(WinForms.Form):
 
     def _do_extract(self, section, index, zip_path, dest_dir):
         """Extract flat into dest_dir, open .wbpj, offer to set as source."""
+        # Fix 3: guard against empty/whitespace dest_dir (stale local_extract_path
+        # cleared, or dialog returned no destination) -- fall back to the
+        # section's repository archive directory (same dir as the ZIP).
+        if not dest_dir or not dest_dir.strip():
+            dest_dir = os.path.dirname(zip_path)
+            _log("dest_dir was empty -- falling back to: " + dest_dir)
         prog = ArchiveProgressDialog(
             u"Extracting: {0}".format(os.path.basename(zip_path)),
             owner=self)
@@ -1996,6 +2009,29 @@ class RepositoryForm(WinForms.Form):
 
     def _on_double_click(self, sender, e):
         self._on_open(sender, e)
+
+    def _on_archive_single(self, section, index):
+        """Fix 6: open ArchiveDialog pre-filtered to a single record."""
+        try:
+            open_proj  = _get_open_project_path()
+            candidates = repo.get_archive_candidates(
+                open_proj, only_section=section, only_index=index)
+            if not candidates:
+                WinForms.MessageBox.Show(
+                    "This file has no source path and cannot be archived "
+                    "(or it is the currently open project).",
+                    "Cannot Archive")
+                return
+            dlg = ArchiveDialog(candidates, open_proj, owner=self)
+            if dlg.ShowDialog() == WinForms.DialogResult.OK:
+                self._refresh_all(None, None)
+                if dlg._archived_results:
+                    self._set_status(
+                        u"Archived {0} file(s)".format(
+                            len(dlg._archived_results)))
+        except Exception as exc:
+            _log("_on_archive_single error: " + traceback.format_exc())
+            WinForms.MessageBox.Show("Archive error:\n" + str(exc), "Error")
 
     def launch_archive_dialog(self):
         try:

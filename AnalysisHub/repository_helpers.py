@@ -313,7 +313,22 @@ def get_archive_status(record):
             current_mtime = get_wbpj_latest_mtime(src_path)
         else:
             current_mtime = os.path.getmtime(src_path)
-        if abs(current_mtime - record.get("archive_src_mtime", 0)) > 2:
+        mtime_changed = abs(current_mtime - record.get("archive_src_mtime", 0)) > 2
+        if mtime_changed:
+            # Fix 2: Workbench rewrites session metadata on mere open (no save),
+            # which bumps mtime without changing content. Compare size too --
+            # if size is unchanged, suppress the false "Source Changed" flag.
+            try:
+                # archive_src_size is recorded as os.path.getsize(src_path)
+                # regardless of method -- match that here for an apples-to-
+                # apples comparison.
+                current_size = os.path.getsize(src_path)
+            except Exception:
+                current_size = -1
+            archived_size = record.get("archive_src_size", -1)
+            if current_size == archived_size:
+                mtime_changed = False
+        if mtime_changed:
             return ARCH_STATUS_OUTDATED + tag
     except Exception:
         return ARCH_STATUS_OUTDATED + tag
@@ -528,7 +543,7 @@ def copy_wbpj_with_files_delta(wbpj_path, dest_dir, include_results=False,
 
 
 def zip_wbpj_with_files(wbpj_path, dest_dir, include_results=False,
-                         progress_callback=None):
+                         progress_callback=None, compresslevel=1):
     """
     Create a ZIP archive of a .wbpj + _files folder in dest_dir.
     Returns the path of the created .zip file.
@@ -560,8 +575,18 @@ def zip_wbpj_with_files(wbpj_path, dest_dir, include_results=False,
 
     file_count = skip_count = 0
 
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED,
-                         allowZip64=True) as zf:
+    # Fix 5: default to fast compression (level 1). Level 6 (Python default)
+    # is much slower on large files for modest size savings. IronPython 2.7's
+    # zipfile supports compresslevel as of CPython 3.7 equivalent stdlib port;
+    # guard with try/except for older runtimes that ignore the kwarg.
+    try:
+        zf_handle = zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED,
+                                     allowZip64=True, compresslevel=compresslevel)
+    except TypeError:
+        zf_handle = zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED,
+                                     allowZip64=True)
+
+    with zf_handle as zf:
         arcname = os.path.basename(wbpj_path)
         zf.write(wbpj_path, arcname)
         file_count += 1
@@ -1123,15 +1148,26 @@ def get_summary_stats():
 #  Archive candidate builder
 # ────────────────────────────────────────────────────────────────────────────
 
-def get_archive_candidates(open_project_path=None):
+def get_archive_candidates(open_project_path=None, only_section=None,
+                            only_index=None):
+    """
+    Build the candidate list for ArchiveDialog.
+
+    only_section / only_index: if both given, restrict the result to that
+    single manifest record (Fix 6 -- per-row "Archive this file...").
+    """
     open_norm = (os.path.normcase(os.path.abspath(open_project_path))
                  if open_project_path else None)
     data       = load_manifest()
     candidates = []
 
     for sec in ALL_SECTIONS:
+        if only_section is not None and sec != only_section:
+            continue
         records = data["sections"].get(sec, [])
         for i, r in enumerate(records):
+            if only_index is not None and i != only_index:
+                continue
             src = r.get("source_path", "")
             if not src:
                 continue
