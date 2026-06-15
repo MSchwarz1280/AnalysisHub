@@ -206,31 +206,97 @@ def _make_btn(text, x, y, w=160, h=36, primary=False, handler=None):
 
 
 class NotesDialog(WinForms.Form):
-    def __init__(self, current_notes=""):
-        self.result_notes  = current_notes
-        self.Text          = "File Notes"
-        self.Width         = 480
-        self.Height        = 260
-        self.StartPosition = WinForms.FormStartPosition.CenterParent
-        self.MinimizeBox = self.MaximizeBox = False
-        self.BackColor   = Drawing.Color.White
-        self.Font        = _FONT_NORMAL
+    """
+    Notes editor popup.
+
+    Changes (v8e):
+    * Title bar now shows the file name: "Notes — <filename>"
+    * Window is resizable; the text area stretches with the window.
+    * OK / Cancel buttons stay pinned to the bottom-right corner.
+    """
+
+    _BTN_W    = 90
+    _BTN_H    = 32
+    _BTN_GAP  = 8          # gap between the two buttons
+    _BTN_PAD  = 12         # gap from right edge and bottom edge
+
+    def __init__(self, current_notes="", file_label=""):
+        self.result_notes = current_notes
+
+        # Title: "Notes — filename" if a label was supplied, plain otherwise
+        if file_label:
+            self.Text = u"Notes \u2014 {0}".format(file_label)
+        else:
+            self.Text = "File Notes"
+
+        self.Width           = 500
+        self.Height          = 300
+        self.MinimumSize     = Drawing.Size(380, 220)
+        self.StartPosition   = WinForms.FormStartPosition.CenterParent
+        self.MinimizeBox     = False
+        self.MaximizeBox     = True          # allow resize / maximise
+        self.BackColor       = Drawing.Color.White
+        self.Font            = _FONT_NORMAL
+
         lbl = WinForms.Label()
-        lbl.Text = "Notes / Description:"
+        lbl.Text     = "Notes / Description:"
         lbl.Location = Drawing.Point(12, 12)
         lbl.AutoSize = True
+        lbl.Anchor   = WinForms.AnchorStyles.Top | WinForms.AnchorStyles.Left
         self.Controls.Add(lbl)
+
         self._tb = WinForms.TextBox()
         self._tb.Multiline  = True
         self._tb.ScrollBars = WinForms.ScrollBars.Vertical
         self._tb.Location   = Drawing.Point(12, 36)
-        self._tb.Size       = Drawing.Size(440, 140)
         self._tb.Text       = current_notes
+        # Anchor all four sides so it stretches when the dialog is resized
+        self._tb.Anchor = (WinForms.AnchorStyles.Top    |
+                           WinForms.AnchorStyles.Bottom |
+                           WinForms.AnchorStyles.Left   |
+                           WinForms.AnchorStyles.Right)
         self.Controls.Add(self._tb)
-        self.Controls.Add(_make_btn("OK",     260, 185, 90, 32, primary=True,
-                                    handler=self._ok))
-        self.Controls.Add(_make_btn("Cancel", 360, 185, 90, 32,
-                                    handler=self._cancel))
+
+        # OK / Cancel — anchored bottom-right
+        self._btn_ok = _make_btn("OK",     0, 0, self._BTN_W, self._BTN_H,
+                                 primary=True, handler=self._ok)
+        self._btn_ok.Anchor = (WinForms.AnchorStyles.Bottom |
+                               WinForms.AnchorStyles.Right)
+        self.Controls.Add(self._btn_ok)
+
+        self._btn_cn = _make_btn("Cancel", 0, 0, self._BTN_W, self._BTN_H,
+                                 handler=self._cancel)
+        self._btn_cn.Anchor = (WinForms.AnchorStyles.Bottom |
+                               WinForms.AnchorStyles.Right)
+        self.Controls.Add(self._btn_cn)
+
+        # Position everything once now; Resize event keeps it correct.
+        self._layout()
+        self.Resize += lambda s, e: self._layout()
+
+    def _layout(self):
+        """Resize the textbox and reposition the buttons."""
+        try:
+            cw = self.ClientSize.Width
+            ch = self.ClientSize.Height
+            p  = self._BTN_PAD
+
+            # Buttons sit at the bottom-right
+            btn_y    = ch - self._BTN_H - p
+            cancel_x = cw - self._BTN_W - p
+            ok_x     = cancel_x - self._BTN_W - self._BTN_GAP
+
+            self._btn_ok.Location = Drawing.Point(ok_x, btn_y)
+            self._btn_cn.Location = Drawing.Point(cancel_x, btn_y)
+
+            # Text area fills the space above the buttons
+            tb_right  = cw - 12
+            tb_bottom = btn_y - 8
+            tb_w = max(100, tb_right - 12)
+            tb_h = max(60,  tb_bottom - 36)
+            self._tb.Size = Drawing.Size(tb_w, tb_h)
+        except Exception:
+            pass
 
     def _ok(self, s, e):
         self.result_notes = self._tb.Text
@@ -2213,9 +2279,11 @@ class RepositoryForm(WinForms.Form):
                 WinForms.MessageBox.Show("Select a file first.", "Notes")
                 return
             idx, record = sel[0]
-            dlg = NotesDialog(record.get("notes", ""))
+            file_label  = record.get("label", "")
+            dlg = NotesDialog(record.get("notes", ""), file_label=file_label)
             if dlg.ShowDialog() == WinForms.DialogResult.OK:
                 repo.update_file_notes(self._cur_section, idx, dlg.result_notes)
+                # Refresh data but restore selection so the row stays highlighted
                 self._refresh_all(None, None)
         except Exception as exc:
             _log("Notes error: " + str(exc))
