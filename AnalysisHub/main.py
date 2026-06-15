@@ -1,22 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-main.py  v8  -  AnalysisHub ACT Extension
-==========================================
+main.py  v1.0  -  AnalysisHub ACT Extension
+============================================
 IronPython 2.7 / ANSYS Workbench 2024 R2+
 
-v8 changes
-----------
-* Remove prompts to delete physical archive file on remove (Notes 3/4)
-* ZipOpenDialog: "Open original source file" option when source exists
-* Flat extraction into section archive dir (no subfolder)
-* Progress dialog parented to RepositoryForm, determinate with file count
-* Archive method tag in status: [ZIP] / [Copy]
-* Results exclusion checkbox for copy-with-files method
-* Health Check: Orphaned Archive Files section with Delete option
-* Right-click: Open Ref Directory / Open Repository Directory
-* "Unarchived -- Archive when ready" status
-* Delta re-archive for copy_with_files method
-* Relative archive_path -- works on any machine after WBPZ transfer
+v1.0 changes (Group 1 + Group 2)
+----------------------------------
+* in_user_files: files inside user_files tree stored with relative path,
+  shown as "Local ✔" -- no archiving needed, path survives project transfer.
+* local_extract_path stored relative to repo root when inside repo.
+* Option B: .wbpz records can link a source .wbpj for change detection.
+  Status shows "⚠ Source Project Changed" if .wbpj is newer than .wbpz.
+* Version stamp v1.0 in title bar and debug log.
+* Help button in RepositoryForm toolbar + Workbench toolbar entry (XML).
+  Opens AnalysisHub_Manual.pdf from <InstallDir>\Help\ folder.
+* NotesDialog: filename in title bar, resizable, textarea anchors.
+* Best-practice nudge when adding .wbpj to Supplemental WB Database tab.
+* Status bar shows live file count on open.
+* Right-click: Link Source Project / Clear Source Link for .wbpz records.
 """
 
 import os
@@ -48,7 +49,7 @@ LOG_PATH = r"C:\Temp\AnalysisHub_debug.log"
 try:
     with open(LOG_PATH, "w") as _fh:
         _fh.write("=" * 80 + "\n")
-        _fh.write("  AnalysisHub v8  -  {0}\n".format(
+        _fh.write("  AnalysisHub v1.0  -  {0}\n".format(
             datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
         _fh.write("=" * 80 + "\n")
 except Exception:
@@ -161,6 +162,40 @@ def _smart_open_file(path):
         return False
 
 
+def open_help(task=None):
+    """
+    Open the AnalysisHub PDF manual from the extension's Help\ sub-folder.
+    Called from:
+      - The Help toolbar button inside RepositoryForm (WinForms handler).
+      - The <onclick>open_help</onclick> entry in AnalysisHub.xml (ACT callback).
+    """
+    try:
+        install_dir = ExtAPI.Extension.InstallDir
+    except Exception:
+        install_dir = os.path.dirname(os.path.abspath(__file__))
+
+    help_file = System.IO.Path.Combine(install_dir, "Help", "AnalysisHub_Manual.pdf")
+    _log("Opening help: " + help_file)
+
+    if not System.IO.File.Exists(help_file):
+        WinForms.MessageBox.Show(
+            u"Help file not found:\n{0}\n\n"
+            u"Please ensure AnalysisHub_Manual.pdf is present in the "
+            u"Help\\ folder alongside the extension files.".format(help_file),
+            u"AnalysisHub \u2014 Help",
+            WinForms.MessageBoxButtons.OK,
+            WinForms.MessageBoxIcon.Information)
+        return
+
+    try:
+        System.Diagnostics.Process.Start(help_file)
+    except Exception as exc:
+        _log("open_help error: " + str(exc))
+        WinForms.MessageBox.Show(
+            u"Could not open help file:\n" + help_file,
+            u"AnalysisHub \u2014 Help")
+
+
 _CLR_ANSYS_BLUE  = Drawing.Color.FromArgb(0,   120, 212)
 _CLR_READY       = Drawing.Color.FromArgb(16,  124,  16)
 _CLR_MISSING     = Drawing.Color.FromArgb(209,  52,  56)
@@ -168,6 +203,8 @@ _CLR_ARCHIVED_OK = Drawing.Color.FromArgb(0,   102, 204)
 _CLR_ARCHIVED_OLD= Drawing.Color.FromArgb(200, 100,   0)
 _CLR_UNARCHIVED  = Drawing.Color.FromArgb(128,   0, 128)
 _CLR_GREEN_DIM   = Drawing.Color.FromArgb(0,   128,   0)
+_CLR_LOCAL       = Drawing.Color.FromArgb(0,   128,   0)   # green — Local ✔
+_CLR_SRC_CHANGED = Drawing.Color.FromArgb(180,  80,   0)   # amber — ⚠ Source Changed
 
 _FONT_NORMAL = Drawing.Font("Segoe UI",  9.5)
 _FONT_BOLD   = Drawing.Font("Segoe UI",  9.5, Drawing.FontStyle.Bold)
@@ -207,36 +244,28 @@ def _make_btn(text, x, y, w=160, h=36, primary=False, handler=None):
 
 class NotesDialog(WinForms.Form):
     """
-    Notes editor popup.
-
-    Changes (v8e):
-    * Title bar now shows the file name: "Notes — <filename>"
-    * Window is resizable; the text area stretches with the window.
-    * OK / Cancel buttons stay pinned to the bottom-right corner.
+    Resizable notes editor.
+    * Title bar shows "Notes — <filename>" when file_label is supplied.
+    * Text area anchors to all four edges so it stretches with the window.
+    * OK / Cancel stay pinned bottom-right at all sizes.
     """
-
-    _BTN_W    = 90
-    _BTN_H    = 32
-    _BTN_GAP  = 8          # gap between the two buttons
-    _BTN_PAD  = 12         # gap from right edge and bottom edge
+    _BTN_W   = 90
+    _BTN_H   = 32
+    _BTN_GAP = 8
+    _BTN_PAD = 12
 
     def __init__(self, current_notes="", file_label=""):
         self.result_notes = current_notes
-
-        # Title: "Notes — filename" if a label was supplied, plain otherwise
-        if file_label:
-            self.Text = u"Notes \u2014 {0}".format(file_label)
-        else:
-            self.Text = "File Notes"
-
-        self.Width           = 500
-        self.Height          = 300
-        self.MinimumSize     = Drawing.Size(380, 220)
-        self.StartPosition   = WinForms.FormStartPosition.CenterParent
-        self.MinimizeBox     = False
-        self.MaximizeBox     = True          # allow resize / maximise
-        self.BackColor       = Drawing.Color.White
-        self.Font            = _FONT_NORMAL
+        self.Text = (u"Notes \u2014 {0}".format(file_label)
+                     if file_label else "File Notes")
+        self.Width         = 500
+        self.Height        = 300
+        self.MinimumSize   = Drawing.Size(380, 220)
+        self.StartPosition = WinForms.FormStartPosition.CenterParent
+        self.MinimizeBox   = False
+        self.MaximizeBox   = True
+        self.BackColor     = Drawing.Color.White
+        self.Font          = _FONT_NORMAL
 
         lbl = WinForms.Label()
         lbl.Text     = "Notes / Description:"
@@ -250,15 +279,13 @@ class NotesDialog(WinForms.Form):
         self._tb.ScrollBars = WinForms.ScrollBars.Vertical
         self._tb.Location   = Drawing.Point(12, 36)
         self._tb.Text       = current_notes
-        # Anchor all four sides so it stretches when the dialog is resized
-        self._tb.Anchor = (WinForms.AnchorStyles.Top    |
-                           WinForms.AnchorStyles.Bottom |
-                           WinForms.AnchorStyles.Left   |
-                           WinForms.AnchorStyles.Right)
+        self._tb.Anchor     = (WinForms.AnchorStyles.Top    |
+                               WinForms.AnchorStyles.Bottom |
+                               WinForms.AnchorStyles.Left   |
+                               WinForms.AnchorStyles.Right)
         self.Controls.Add(self._tb)
 
-        # OK / Cancel — anchored bottom-right
-        self._btn_ok = _make_btn("OK",     0, 0, self._BTN_W, self._BTN_H,
+        self._btn_ok = _make_btn("OK", 0, 0, self._BTN_W, self._BTN_H,
                                  primary=True, handler=self._ok)
         self._btn_ok.Anchor = (WinForms.AnchorStyles.Bottom |
                                WinForms.AnchorStyles.Right)
@@ -270,31 +297,21 @@ class NotesDialog(WinForms.Form):
                                WinForms.AnchorStyles.Right)
         self.Controls.Add(self._btn_cn)
 
-        # Position everything once now; Resize event keeps it correct.
         self._layout()
         self.Resize += lambda s, e: self._layout()
 
     def _layout(self):
-        """Resize the textbox and reposition the buttons."""
         try:
             cw = self.ClientSize.Width
             ch = self.ClientSize.Height
             p  = self._BTN_PAD
-
-            # Buttons sit at the bottom-right
             btn_y    = ch - self._BTN_H - p
             cancel_x = cw - self._BTN_W - p
             ok_x     = cancel_x - self._BTN_W - self._BTN_GAP
-
-            self._btn_ok.Location = Drawing.Point(ok_x, btn_y)
+            self._btn_ok.Location = Drawing.Point(ok_x,     btn_y)
             self._btn_cn.Location = Drawing.Point(cancel_x, btn_y)
-
-            # Text area fills the space above the buttons
-            tb_right  = cw - 12
-            tb_bottom = btn_y - 8
-            tb_w = max(100, tb_right - 12)
-            tb_h = max(60,  tb_bottom - 36)
-            self._tb.Size = Drawing.Size(tb_w, tb_h)
+            self._tb.Size = Drawing.Size(max(100, cw - 24),
+                                         max(60,  btn_y - 44))
         except Exception:
             pass
 
@@ -1568,7 +1585,7 @@ class RepositoryForm(WinForms.Form):
                               for sec in repo.ALL_SECTIONS}
         self._cur_section  = repo.ALL_SECTIONS[0]
 
-        self.Text          = "Analysis Repository Manager"
+        self.Text          = "Analysis Repository Manager  \u2014  v1.0"
         self.Width         = 1360
         self.Height        = 900
         self.StartPosition = WinForms.FormStartPosition.CenterParent
@@ -1615,6 +1632,14 @@ class RepositoryForm(WinForms.Form):
             self.Controls.Add(_make_btn(text, x, toolbar_y, w, toolbar_h,
                                         primary=primary, handler=handler))
             x += w + 8
+
+        # Help button — separated by a small visual gap from the action buttons
+        x += 12   # extra gap makes the grouping visually distinct
+        btn_help = _make_btn(u"\u2753  Help", x, toolbar_y, 90, toolbar_h,
+                             handler=lambda s, e: open_help())
+        btn_help.ForeColor = _CLR_ANSYS_BLUE
+        btn_help.Font      = _FONT_BOLD
+        self.Controls.Add(btn_help)
 
         sep = WinForms.Label()
         sep.BorderStyle = WinForms.BorderStyle.Fixed3D
@@ -1802,12 +1827,12 @@ class RepositoryForm(WinForms.Form):
             item.SubItems.Add(r.get("modified",   u"\u2014"))
             item.SubItems.Add(r.get("date_added", ""))
             item.SubItems.Add(r.get("notes",      ""))
-            path = r.get("source_path", "")
+            # Use resolved absolute path for display and selection restore
+            path = r.get("source_path_abs", "") or r.get("source_path", "")
             item.SubItems.Add(path)
 
-            arch_abs = r.get("archive_path_abs", "")
-            truly_missing = (repo.ARCH_STATUS_MISSING in status and
-                             not arch_abs)
+            arch_abs      = r.get("archive_path_abs", "")
+            truly_missing = (repo.ARCH_STATUS_MISSING in status and not arch_abs)
 
             if truly_missing:
                 item.ForeColor = _CLR_MISSING
@@ -1821,6 +1846,13 @@ class RepositoryForm(WinForms.Form):
             elif repo.ARCH_STATUS_UNARCHIVED in status:
                 item.ForeColor = _CLR_UNARCHIVED
                 item.Font      = _FONT_NORMAL
+            elif repo.ARCH_STATUS_LOCAL in status:
+                item.ForeColor = _CLR_LOCAL
+                item.Font      = _FONT_NORMAL
+            elif (repo.ARCH_STATUS_SRC_CHANGED in status or
+                  repo.ARCH_STATUS_SRC_MISSING in status):
+                item.ForeColor = _CLR_SRC_CHANGED
+                item.Font      = _FONT_BOLD
             else:
                 item.ForeColor = Drawing.Color.Black
                 item.Font      = _FONT_NORMAL
@@ -1931,6 +1963,24 @@ class RepositoryForm(WinForms.Form):
             item_archive_one = menu.Items.Add(u"\U0001F4E6  Archive this file\u2026")
             item_archive_one.Click += lambda s2, e2: self._on_archive_single(_sec, _idx)
 
+            # ── Option B: .wbpz source-project linkage ────────────────────────
+            ext = os.path.splitext(src_path)[1].lower() if src_path else ""
+            if ext == ".wbpz":
+                menu.Items.Add(WinForms.ToolStripSeparator())
+                has_src_link = bool(record.get("source_wbpj_path", ""))
+
+                item_link = menu.Items.Add(u"\U0001F517  Link Source Project (.wbpj)\u2026")
+                def _do_link(s2, e2, _s=_sec, _i=_idx):
+                    self._on_link_source_wbpj(_s, _i)
+                item_link.Click += _do_link
+
+                item_clear_link = menu.Items.Add(u"\u26D4  Clear Source Project Link")
+                item_clear_link.Enabled = has_src_link
+                def _do_clear(s2, e2, _s=_sec, _i=_idx):
+                    repo.clear_source_wbpj(_s, _i)
+                    self._refresh_all(None, None)
+                item_clear_link.Click += _do_clear
+
             menu.Items.Add(WinForms.ToolStripSeparator())
 
             item_remove = menu.Items.Add(u"\u2716  Remove from Repository")
@@ -1939,6 +1989,27 @@ class RepositoryForm(WinForms.Form):
             menu.Show(lv, Drawing.Point(e.X, e.Y))
         except Exception as exc:
             _log("Context menu error: " + str(exc))
+
+    def _on_link_source_wbpj(self, section, index):
+        """Option B: let user browse to the .wbpj that was archived to produce this .wbpz."""
+        try:
+            records = self._section_data.get(section, [])
+            if index < 0 or index >= len(records):
+                return
+            label = records[index].get("label", "")
+            dlg = WinForms.OpenFileDialog()
+            dlg.Title  = u"Link source .wbpj for \"{0}\"".format(label)
+            dlg.Filter = "Workbench Projects (*.wbpj)|*.wbpj|All Files (*.*)|*.*"
+            if dlg.ShowDialog() != WinForms.DialogResult.OK:
+                return
+            repo.link_source_wbpj(section, index, dlg.FileName)
+            self._refresh_all(None, None)
+            self._set_status(
+                u"Source project linked: {0}".format(
+                    os.path.basename(dlg.FileName)))
+        except Exception as exc:
+            _log("Link source wbpj error: " + str(exc))
+            WinForms.MessageBox.Show("Link failed:\n" + str(exc), "Error")
 
     def _on_open(self, sender, e):
         try:
@@ -2214,16 +2285,41 @@ class RepositoryForm(WinForms.Form):
                           "Spreadsheets (*.xlsx;*.xls;*.xlsm)|*.xlsx;*.xls;*.xlsm|"
                           "PDF Files (*.pdf)|*.pdf|"
                           "Text / Data (*.txt;*.csv;*.json)|*.txt;*.csv;*.json")
-            if dlg.ShowDialog() == WinForms.DialogResult.OK:
-                added = skipped = 0
-                for path in dlg.FileNames:
-                    if repo.add_file_record(self._cur_section, path):
-                        added += 1
-                    else:
-                        skipped += 1
-                self._refresh_all(None, None)
-                self._set_status(
-                    u"Added {0} file(s). {1} skipped.".format(added, skipped))
+            if dlg.ShowDialog() != WinForms.DialogResult.OK:
+                return
+
+            # ── Best-practice nudge: .wbpj on Supplemental tab ────────────────────
+            is_supplemental = (self._cur_section == "supplemental_wb_database")
+            has_wbpj = any(f.lower().endswith(".wbpj") for f in dlg.FileNames)
+            if is_supplemental and has_wbpj:
+                res = WinForms.MessageBox.Show(
+                    u"Best Practice \u2014 Supplemental Databases\n\n"
+                    u"You are adding a Workbench project (.wbpj) to the "
+                    u"Supplemental WB Database section.\n\n"
+                    u"Recommended workflow:\n"
+                    u"  \u2022 Open the project in Workbench.\n"
+                    u"  \u2022 Use File \u2192 Archive to create a .wbpz file.\n"
+                    u"  \u2022 Add that .wbpz here instead of the .wbpj.\n\n"
+                    u"Benefits of referencing a .wbpz:\n"
+                    u"  \u2022 File opens directly \u2014 no extraction needed.\n"
+                    u"  \u2022 Original .wbpj is protected from accidental edits.\n"
+                    u"  \u2022 Archiving in the hub is as simple as any other file.\n\n"
+                    u"Continue adding the .wbpj anyway?",
+                    u"Best Practice Reminder",
+                    WinForms.MessageBoxButtons.YesNo,
+                    WinForms.MessageBoxIcon.Information)
+                if res != WinForms.DialogResult.Yes:
+                    return
+
+            added = skipped = 0
+            for path in dlg.FileNames:
+                if repo.add_file_record(self._cur_section, path):
+                    added += 1
+                else:
+                    skipped += 1
+            self._refresh_all(None, None)
+            self._set_status(
+                u"Added {0} file(s). {1} skipped.".format(added, skipped))
         except Exception as exc:
             _log("Add error: " + traceback.format_exc())
             WinForms.MessageBox.Show("Add failed:\n" + str(exc), "Error")
@@ -2283,7 +2379,6 @@ class RepositoryForm(WinForms.Form):
             dlg = NotesDialog(record.get("notes", ""), file_label=file_label)
             if dlg.ShowDialog() == WinForms.DialogResult.OK:
                 repo.update_file_notes(self._cur_section, idx, dlg.result_notes)
-                # Refresh data but restore selection so the row stays highlighted
                 self._refresh_all(None, None)
         except Exception as exc:
             _log("Notes error: " + str(exc))

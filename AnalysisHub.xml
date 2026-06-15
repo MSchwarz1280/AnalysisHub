@@ -4,7 +4,7 @@
   Compatible: ANSYS Workbench 2024 R2 (v242) and later
   Purpose: Centralized Analysis Repository Manager in the Project Schematic
 -->
-<extension version="8" minorversion="3" name="AnalysisHub">
+<extension version="8" minorversion="4" name="AnalysisHub">
 
   <!-- Unique GUID for this extension - do not change after deployment -->
   <guid shortid="AnalysisHub">4a65b67b-e813-4566-86bd-d288a00303d4</guid>
@@ -20,6 +20,11 @@
       <entry name="OpenRepository" caption="Analysis Repository" icon="hub_toolbar">
         <callbacks>
           <onclick>toolbar_open_repository</onclick>
+        </callbacks>
+      </entry>
+      <entry name="OpenHelp" caption="Help" icon="Help">
+        <callbacks>
+          <onclick>open_help</onclick>
         </callbacks>
       </entry>
     </toolbar>

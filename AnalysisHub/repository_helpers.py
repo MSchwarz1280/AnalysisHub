@@ -64,11 +64,14 @@ SECTION_LABELS = {
 
 # ── Archive status strings ───────────────────────────────────────────────────
 # Method tags appended at runtime: [ZIP] or [Copy]
-ARCH_STATUS_NONE       = "Ready"
-ARCH_STATUS_OK         = u"Archived \u2714"
-ARCH_STATUS_OUTDATED   = u"Archived \u2718 \u2014 Source Changed"
-ARCH_STATUS_MISSING    = "MISSING"
-ARCH_STATUS_UNARCHIVED = u"Unarchived \u2014 Archive when ready"
+ARCH_STATUS_NONE         = "Ready"
+ARCH_STATUS_OK           = u"Archived \u2714"
+ARCH_STATUS_OUTDATED     = u"Archived \u2718 \u2014 Source Changed"
+ARCH_STATUS_MISSING      = "MISSING"
+ARCH_STATUS_UNARCHIVED   = u"Unarchived \u2014 Archive when ready"
+ARCH_STATUS_LOCAL        = u"Local \u2714"              # file lives inside user_files tree
+ARCH_STATUS_SRC_CHANGED  = u"\u26A0 Source Project Changed"   # .wbpz: linked .wbpj is newer
+ARCH_STATUS_SRC_MISSING  = u"\u26A0 Source Project Missing"   # .wbpz: linked .wbpj gone
 
 DEFAULT_MANIFEST = {
     "schema_version": 2,
@@ -195,6 +198,40 @@ def _resolve_archive_path(stored_path):
     return os.path.join(get_repo_root(), stored_path)
 
 
+def _resolve_source_path(record):
+    """
+    Return the absolute source path for a record, handling both:
+      - in_user_files=True  : stored relative to get_base_directory()
+      - normal records       : stored absolute (use as-is)
+    """
+    stored = record.get("source_path", "")
+    if not stored:
+        return ""
+    if record.get("in_user_files") and not os.path.isabs(stored):
+        try:
+            return os.path.join(get_base_directory(), stored)
+        except Exception:
+            return stored
+    return stored
+
+
+def _resolve_local_extract(record):
+    """
+    Resolve local_extract_path to absolute.
+    Stored relative to repo_root when inside repo, absolute otherwise.
+    Returns empty string if not set.
+    """
+    stored = record.get("local_extract_path", "")
+    if not stored:
+        return ""
+    if os.path.isabs(stored):
+        return stored
+    try:
+        return os.path.join(get_repo_root(), stored)
+    except Exception:
+        return stored
+
+
 # ────────────────────────────────────────────────────────────────────────────
 #  Manifest I/O
 # ────────────────────────────────────────────────────────────────────────────
@@ -273,35 +310,64 @@ def get_archive_status(record):
     Return the archive status string for a record, including method tag.
 
     Status strings:
-        "Ready"                              — no source, no archive
-        "Unarchived — Archive when ready"    — has source (extracted), no archive
-        "MISSING"                            — source gone, no archive
-        "Archived ✔ [ZIP]"                  — archived and current
+        "Ready"                                  — no source, no archive
+        "Unarchived — Archive when ready"        — was extracted source, no archive
+        "MISSING"                                — source gone, no archive
+        "Local ✔"                               — file lives inside user_files tree
+        "Archived ✔ [ZIP]"                      — archived and current
         "Archived ✔ [Copy]"
-        "Archived ✘ — Source Changed [ZIP]" — archived but stale
+        "Archived ✘ — Source Changed [ZIP]"     — archived but stale
         "Archived ✘ — Source Changed [Copy]"
+        "⚠ Source Project Changed"              — .wbpz: linked .wbpj is newer
+        "⚠ Source Project Missing"              — .wbpz: linked .wbpj gone
     """
-    src_path = record.get("source_path", "")
+    # ── in_user_files records: resolve relative path, report Local ✔ ────────
+    if record.get("in_user_files"):
+        abs_path = _resolve_source_path(record)
+        if abs_path and os.path.exists(abs_path):
+            return ARCH_STATUS_LOCAL
+        return ARCH_STATUS_MISSING
+
+    src_path = _resolve_source_path(record)
     method   = record.get("archive_method", "")
     tag      = _method_tag(method)
 
-    # Resolve archive path (handles both relative and absolute)
     raw_arch = record.get("archive_path", "")
     arch_abs = _resolve_archive_path(raw_arch)
     has_arch = bool(arch_abs) and os.path.exists(arch_abs)
-
     src_exists = bool(src_path) and os.path.exists(src_path)
 
     if not src_exists and not has_arch:
         return ARCH_STATUS_MISSING
 
     if not src_exists and has_arch:
-        # Source gone but archive exists — OK for recipient machines
+        # Source gone but archive exists — OK for recipient machines.
+        # Before returning OK, check Option B source-linkage for .wbpz.
+        src_wbpj = record.get("source_wbpj_path", "")
+        if src_wbpj:
+            if not os.path.exists(src_wbpj):
+                return ARCH_STATUS_SRC_MISSING
         return ARCH_STATUS_OK + tag
 
-    # Source exists
+    # Source exists — check Option B source-linkage (.wbpz records)
+    if src_exists:
+        ext = os.path.splitext(src_path)[1].lower()
+        if ext == ".wbpz":
+            src_wbpj = record.get("source_wbpj_path", "")
+            if src_wbpj:
+                if not os.path.exists(src_wbpj):
+                    return ARCH_STATUS_SRC_MISSING
+                try:
+                    wbpj_mtime    = os.path.getmtime(src_wbpj)
+                    wbpz_mtime    = os.path.getmtime(src_path)
+                    baseline      = record.get("source_wbpj_mtime", wbpj_mtime)
+                    # Flag if .wbpj is newer than the .wbpz OR newer than baseline
+                    if wbpj_mtime > wbpz_mtime or wbpj_mtime > baseline + 2:
+                        return ARCH_STATUS_SRC_CHANGED
+                except Exception:
+                    pass   # can't determine — don't flag
+
     if not has_arch:
-        # Check if this was previously designated as working source
         if record.get("_was_extracted_source"):
             return ARCH_STATUS_UNARCHIVED
         return ARCH_STATUS_NONE
@@ -315,16 +381,10 @@ def get_archive_status(record):
             current_mtime = os.path.getmtime(src_path)
         mtime_changed = abs(current_mtime - record.get("archive_src_mtime", 0)) > 2
         if mtime_changed:
-            # Fix 2: Workbench rewrites session metadata on mere open (no save),
-            # which bumps mtime without changing content. Compare size too --
-            # if size is unchanged, suppress the false "Source Changed" flag.
             try:
-                # archive_src_size is recorded as os.path.getsize(src_path)
-                # regardless of method -- match that here for an apples-to-
-                # apples comparison.
-                current_size = os.path.getsize(src_path)
+                current_size  = os.path.getsize(src_path)
             except Exception:
-                current_size = -1
+                current_size  = -1
             archived_size = record.get("archive_src_size", -1)
             if current_size == archived_size:
                 mtime_changed = False
@@ -700,16 +760,31 @@ def update_archive_record(section, index, archive_path, method):
 
 
 def update_local_extract(section, index, extracted_wbpj_path):
-    """Save local extraction path for a ZIP-archived record."""
+    """
+    Save local extraction path for a ZIP-archived record.
+    If the extracted path is inside the repo root, store it relative to
+    repo root so the path survives a cross-machine transfer.
+    """
     data    = load_manifest()
     records = data["sections"].get(section, [])
     if index < 0 or index >= len(records):
         return False
-    records[index]["local_extract_path"] = extracted_wbpj_path
+
+    stored = extracted_wbpj_path
+    try:
+        repo_root = os.path.normcase(os.path.abspath(get_repo_root()))
+        abs_ext   = os.path.normcase(os.path.abspath(extracted_wbpj_path))
+        if abs_ext.startswith(repo_root + os.sep):
+            stored = os.path.relpath(extracted_wbpj_path, get_repo_root())
+            _safe_log("local_extract stored relative: " + stored)
+    except Exception as exc:
+        _safe_log("local_extract relative check error: " + str(exc))
+
+    records[index]["local_extract_path"] = stored
     records[index]["local_extract_date"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     save_manifest(data)
     _safe_log("Local extract saved [{0}][{1}]: {2}".format(
-        section, index, extracted_wbpj_path))
+        section, index, stored))
     return True
 
 
@@ -734,9 +809,46 @@ def update_source_path(section, index, new_source_path):
     return True
 
 
+def link_source_wbpj(section, index, wbpj_path):
+    """
+    Option B: Link a .wbpj source project to a .wbpz record.
+    Stores the path and its current mtime as a baseline.
+    If the .wbpj is newer than the .wbpz on next status check, the record
+    will show ARCH_STATUS_SRC_CHANGED.
+    """
+    data    = load_manifest()
+    records = data["sections"].get(section, [])
+    if index < 0 or index >= len(records):
+        return False
+    try:
+        mtime = os.path.getmtime(wbpj_path) if os.path.exists(wbpj_path) else 0
+    except Exception:
+        mtime = 0
+    records[index]["source_wbpj_path"]  = wbpj_path
+    records[index]["source_wbpj_mtime"] = mtime
+    save_manifest(data)
+    _safe_log("Linked source .wbpj [{0}][{1}]: {2}  mtime={3}".format(
+        section, index, wbpj_path, int(mtime)))
+    return True
+
+
+def clear_source_wbpj(section, index):
+    """Remove the linked source .wbpj from a record."""
+    data    = load_manifest()
+    records = data["sections"].get(section, [])
+    if index < 0 or index >= len(records):
+        return False
+    records[index].pop("source_wbpj_path",  None)
+    records[index].pop("source_wbpj_mtime", None)
+    save_manifest(data)
+    _safe_log("Cleared source .wbpj link [{0}][{1}]".format(section, index))
+    return True
+
+
 def prune_stale_fields(section, index):
     """
     Remove source_path and local_extract_path if they don't exist on this machine.
+    Uses _resolve_source_path / _resolve_local_extract so relative paths work.
     Returns dict of what was pruned.
     """
     data    = load_manifest()
@@ -748,16 +860,18 @@ def prune_stale_fields(section, index):
     pruned  = {}
     changed = False
 
-    src = record.get("source_path", "")
-    if src and not os.path.exists(src):
-        pruned["source_path"] = src
-        records[index].pop("source_path", None)
-        changed = True
-        _safe_log("Pruned stale source_path [{0}][{1}]".format(section, index))
+    # Don't prune in_user_files source paths — they're expected to be relative
+    if not record.get("in_user_files"):
+        src_abs = _resolve_source_path(record)
+        if src_abs and not os.path.exists(src_abs):
+            pruned["source_path"] = src_abs
+            records[index].pop("source_path", None)
+            changed = True
+            _safe_log("Pruned stale source_path [{0}][{1}]".format(section, index))
 
-    ext_path = record.get("local_extract_path", "")
-    if ext_path and not os.path.exists(ext_path):
-        pruned["local_extract_path"] = ext_path
+    ext_abs = _resolve_local_extract(record)
+    if ext_abs and not os.path.exists(ext_abs):
+        pruned["local_extract_path"] = ext_abs
         records[index].pop("local_extract_path", None)
         records[index].pop("local_extract_date", None)
         changed = True
@@ -772,25 +886,39 @@ def prune_stale_fields(section, index):
 def get_open_target(record):
     """
     Analyse a record and return a dict describing how it should be opened.
-    Resolves relative archive_path to absolute before checking existence.
+    Resolves relative archive_path and local_extract_path to absolute.
+    Also handles in_user_files records (always opened as source).
     """
-    src      = record.get("source_path", "")
+    src      = _resolve_source_path(record)
     raw_arch = record.get("archive_path", "")
     arch     = _resolve_archive_path(raw_arch)
-    ext_path = record.get("local_extract_path", "")
+    ext_path = _resolve_local_extract(record)
     method   = record.get("archive_method", "")
     is_zip   = (method == "zip")
 
-    has_source  = bool(src)  and os.path.exists(src)
-    has_archive = bool(arch) and os.path.exists(arch)
+    has_source  = bool(src)      and os.path.exists(src)
+    has_archive = bool(arch)     and os.path.exists(arch)
     has_extract = bool(ext_path) and os.path.exists(ext_path)
+
+    # in_user_files records are always opened directly as source — no archiving
+    if record.get("in_user_files"):
+        mode = "source" if has_source else "none"
+        return {
+            "mode":         mode,
+            "source_path":  src,
+            "archive_path": "",
+            "extract_path": "",
+            "has_source":   has_source,
+            "has_archive":  False,
+            "has_extract":  False,
+            "method":       "",
+            "is_zip":       False,
+        }
 
     if is_zip and has_archive:
         if has_extract or has_source:
-            # archive_zip mode shows open options including source (if present)
             mode = "archive_zip"
         else:
-            # No extraction yet, no source on this machine -- prompt to extract
             mode = "extract_first"
     elif has_archive and not is_zip:
         mode = "archive_direct"
@@ -843,9 +971,13 @@ def _enrich_record(record):
     - status reflects archive state (see get_archive_status).
     - archive_path_abs, archive_date_disp, archive_method_disp
       are exposed for the UI status column and tooltips.
+    - in_user_files records resolve their relative source_path against
+      get_base_directory() so the rest of the UI sees an absolute path.
     """
     r    = dict(record)
-    path = r.get("source_path", "")
+    # Resolve absolute source path (handles in_user_files relative paths)
+    path = _resolve_source_path(record)
+    r["source_path_abs"] = path   # absolute path for UI use
 
     arch_abs = _resolve_archive_path(r.get("archive_path", ""))
 
@@ -857,7 +989,6 @@ def _enrich_record(record):
         r["size_mb"]  = u"\u2014"
         r["modified"] = u"\u2014"
     else:
-        # Source exists -- show source file info (owner machine behaviour)
         r["status"] = get_archive_status(record)
         try:
             r["size_mb"] = "{0:.2f}".format(
@@ -874,6 +1005,9 @@ def _enrich_record(record):
     r["archive_path_abs"]    = arch_abs
     r["archive_date_disp"]   = record.get("archive_date", "")
     r["archive_method_disp"] = record.get("archive_method", "")
+    # Expose source-wbpj linkage state for right-click menu logic
+    r["source_wbpj_path"]    = record.get("source_wbpj_path", "")
+    r["in_user_files"]       = record.get("in_user_files", False)
     # NOTE: manifest_index is injected by get_section_records() after this call
     return r
 
@@ -900,6 +1034,14 @@ def get_all_records():
 
 
 def add_file_record(section, path, label=None, notes=""):
+    """
+    Add a file to the manifest.
+
+    If the file lives inside the user_files directory tree (get_base_directory()),
+    it is stored with a relative source_path and flagged in_user_files=True.
+    These files are considered "already home" — they need no archiving and
+    their path resolves correctly on any machine that receives the full project.
+    """
     if section not in SECTION_MAP:
         raise ValueError("Unknown section: " + section)
     data = load_manifest()
@@ -907,16 +1049,39 @@ def add_file_record(section, path, label=None, notes=""):
     if path in existing:
         _safe_log("Duplicate skip: " + path)
         return None
+
+    # ── Check whether the file lives inside user_files ──────────────────────
+    in_user_files = False
+    stored_path   = path
+    try:
+        base = get_base_directory()
+        abs_path = os.path.normcase(os.path.abspath(path))
+        abs_base = os.path.normcase(os.path.abspath(base))
+        # Must be inside user_files but NOT inside the AnalysisRepository sub-dir
+        # (archive files inside the repo are handled separately via archive_path).
+        repo_root = os.path.normcase(os.path.abspath(get_repo_root()))
+        if (abs_path.startswith(abs_base + os.sep) and
+                not abs_path.startswith(repo_root + os.sep)):
+            in_user_files = True
+            stored_path   = os.path.relpath(path, base)   # relative to user_files
+            _safe_log("in_user_files: storing relative path: " + stored_path)
+    except Exception as exc:
+        _safe_log("in_user_files check error (using absolute): " + str(exc))
+
     record = {
-        "label":       label or os.path.basename(path),
-        "source_path": path,
-        "date_added":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "category":    section,
-        "notes":       notes,
+        "label":          label or os.path.basename(path),
+        "source_path":    stored_path,
+        "date_added":     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "category":       section,
+        "notes":          notes,
     }
+    if in_user_files:
+        record["in_user_files"] = True
+
     data["sections"][section].append(record)
     save_manifest(data)
-    _safe_log("Added: {0} -> {1}".format(section, path))
+    _safe_log("Added: {0} -> {1}  (in_user_files={2})".format(
+        section, stored_path, in_user_files))
     return record
 
 
