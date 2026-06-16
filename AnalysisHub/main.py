@@ -1585,7 +1585,7 @@ class RepositoryForm(WinForms.Form):
                               for sec in repo.ALL_SECTIONS}
         self._cur_section  = repo.ALL_SECTIONS[0]
 
-        self.Text          = "Analysis Repository Manager  \u2014  v1.0"
+        self.Text          = u"Analysis Repository Manager  \u2014  v1.0"
         self.Width         = 1360
         self.Height        = 900
         self.StartPosition = WinForms.FormStartPosition.CenterParent
@@ -1960,7 +1960,9 @@ class RepositoryForm(WinForms.Form):
 
             # Fix 6: per-row "Archive this file..." -- opens ArchiveDialog
             # pre-filtered to just this single record.
+            is_local = record.get("in_user_files", False)
             item_archive_one = menu.Items.Add(u"\U0001F4E6  Archive this file\u2026")
+            item_archive_one.Enabled = not is_local
             item_archive_one.Click += lambda s2, e2: self._on_archive_single(_sec, _idx)
 
             # ── Option B: .wbpz source-project linkage ────────────────────────
@@ -2150,6 +2152,17 @@ class RepositoryForm(WinForms.Form):
     def _on_archive_single(self, section, index):
         """Fix 6: open ArchiveDialog pre-filtered to a single record."""
         try:
+            # Guard: in_user_files records are Local — no archiving needed
+            records = self._section_data.get(section, [])
+            if 0 <= index < len(records):
+                if records[index].get("in_user_files"):
+                    WinForms.MessageBox.Show(
+                        u"This file is a Local reference inside the project "
+                        u"directory and does not need to be archived.",
+                        u"Local File \u2014 No Archive Needed",
+                        WinForms.MessageBoxButtons.OK,
+                        WinForms.MessageBoxIcon.Information)
+                    return
             open_proj  = _get_open_project_path()
             candidates = repo.get_archive_candidates(
                 open_proj, only_section=section, only_index=index)

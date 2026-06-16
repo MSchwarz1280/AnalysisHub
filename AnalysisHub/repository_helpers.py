@@ -1333,6 +1333,10 @@ def get_archive_candidates(open_project_path=None, only_section=None,
         for i, r in enumerate(records):
             if only_index is not None and i != only_index:
                 continue
+            # in_user_files records live inside the project tree and are
+            # already "home" — they must never appear in the Archive dialog.
+            if r.get("in_user_files"):
+                continue
             src = r.get("source_path", "")
             if not src:
                 continue
