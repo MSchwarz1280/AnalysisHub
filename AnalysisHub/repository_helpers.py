@@ -1146,24 +1146,51 @@ def update_file_notes(section, index, notes):
 
 
 def relink_file_record(section, index, new_path):
+    """
+    Update source_path for a record to point to a new file location.
+
+    Two modes depending on the existing record state:
+    - Record has an existing source_path (classic relink after file move):
+        Update source_path, update label if it matched the old filename,
+        and clear archive fields so the new source is re-evaluated cleanly.
+    - Record has NO source_path but HAS an archive_path (archive-only /
+        orphan-imported record being connected to its source):
+        Set source_path only. Archive fields are PRESERVED because the
+        archive is still valid — we are just linking the origin.
+        Label is updated to match the new filename.
+    """
     data    = load_manifest()
     records = data["sections"].get(section, [])
-    if 0 <= index < len(records):
-        old_path  = records[index].get("source_path", "")
-        old_label = records[index].get("label", "")
-        if old_label == os.path.basename(old_path):
-            records[index]["label"] = os.path.basename(new_path)
-        records[index]["source_path"] = new_path
+    if not (0 <= index < len(records)):
+        return False
+
+    rec       = records[index]
+    old_path  = rec.get("source_path", "")
+    old_label = rec.get("label", "")
+    has_archive = bool(rec.get("archive_path", ""))
+
+    # Always update the label if it still matches the old filename
+    if not old_label or old_label == os.path.basename(old_path):
+        rec["label"] = os.path.basename(new_path)
+
+    rec["source_path"] = new_path
+
+    if old_path:
+        # Classic relink: source existed before, clear stale archive metadata
         for key in ["archive_path", "archive_date", "archive_src_mtime",
                     "archive_src_size", "archive_method",
                     "local_extract_path", "local_extract_date",
                     "_was_extracted_source"]:
-            records[index].pop(key, None)
-        save_manifest(data)
+            rec.pop(key, None)
         _safe_log("Relinked [{0}][{1}]: {2} -> {3}".format(
             section, index, old_path, new_path))
-        return True
-    return False
+    else:
+        # Archive-only record: preserve archive, just attach source
+        _safe_log("Source connected [{0}][{1}]: archive kept, source={2}".format(
+            section, index, new_path))
+
+    save_manifest(data)
+    return True
 
 
 def rename_file_record(section, index, new_label):

@@ -1717,7 +1717,7 @@ class RepositoryForm(WinForms.Form):
         x = 16
         for text, w, primary, handler in [
             (u"\u2795  Add File(s)...",   160, True,  self._on_add),
-            (u"\u21BA  Refresh",          110, False, self._refresh_all),
+            (u"\u21BA  Refresh",          110, False, self._on_refresh_btn),
             (u"\u25B6  Open",             100, False, self._on_open),
             (u"\u2716  Remove",           110, False, self._on_remove),
             (u"\u270E  Notes",            100, False, self._on_notes),
@@ -1890,32 +1890,39 @@ class RepositoryForm(WinForms.Form):
         self._section_data[section] = sorted(records, key=sk, reverse=not asc)
         self._populate_listview(section, self._section_data[section])
 
+    def _on_refresh_btn(self, sender, e):
+        """
+        Explicit Refresh button handler.
+        Runs the untracked-archive scan ONCE per user click, then refreshes.
+        This is the ONLY place the scan runs — never inside _refresh_all —
+        so that internal refreshes (after save, remove, archive, etc.) cannot
+        trigger the re-add loop.
+        """
+        try:
+            untracked = repo.scan_untracked_archive_files()
+            if untracked:
+                msg = (
+                    u"{0} file(s) were found in the repository directory "
+                    u"that are not currently tracked in the hub.\n\n"
+                    u"These may have been copied here manually via Windows "
+                    u"Explorer.\n\n"
+                    u"Add them to the repository now?".format(len(untracked)))
+                res = WinForms.MessageBox.Show(
+                    msg, u"New Files Detected",
+                    WinForms.MessageBoxButtons.YesNo,
+                    WinForms.MessageBoxIcon.Question)
+                if res == WinForms.DialogResult.Yes:
+                    for u in untracked:
+                        repo.add_orphan_to_manifest(u)
+                    _log("Imported {0} manually-copied file(s)".format(
+                        len(untracked)))
+        except Exception as exc:
+            _log("Untracked scan error: " + str(exc))
+        self._refresh_all(None, None)
+
     def _refresh_all(self, sender, e):
         try:
             _log("Refresh all sections")
-
-            # ── Auto-import files manually copied into the repository dir ────
-            # Scan archive subdirectories for files not in the manifest and
-            # silently add them so they appear in the correct tab.
-            try:
-                untracked = repo.scan_untracked_archive_files()
-                if untracked:
-                    for u in untracked:
-                        repo.add_orphan_to_manifest(u)
-                    _log("Auto-imported {0} manually copied file(s)".format(
-                        len(untracked)))
-                    WinForms.MessageBox.Show(
-                        u"{0} file(s) found in the repository directory that "
-                        u"were not in the manifest.\n\n"
-                        u"They have been added as Archived \u2714 records. "
-                        u"Use right-click \u2192 Relink to connect them to "
-                        u"a source file if one exists.".format(len(untracked)),
-                        u"New Files Detected",
-                        WinForms.MessageBoxButtons.OK,
-                        WinForms.MessageBoxIcon.Information)
-            except Exception as ui_exc:
-                _log("Untracked scan error: " + str(ui_exc))
-
             for sec in repo.ALL_SECTIONS:
                 records = repo.get_section_records(sec)
                 self._section_data[sec] = records
