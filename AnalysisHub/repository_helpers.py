@@ -1253,6 +1253,75 @@ def scan_orphaned_archive_files():
     return orphans
 
 
+def add_orphan_to_manifest(orphan):
+    """
+    Import an orphaned archive file back into the manifest as a tracked record.
+
+    The record is added to orphan["section"] with:
+      - label        = filename (without extension for display clarity)
+      - archive_path = relative path to the file (already inside repo)
+      - archive_method determined by file extension (.zip -> zip, else copy)
+      - No source_path (file is archive-only — "Archived \u2714 [method]")
+
+    Returns the new record dict, or None on failure.
+    """
+    sec      = orphan.get("section", "")
+    path     = orphan.get("path", "")
+    filename = orphan.get("filename", os.path.basename(path))
+    is_dir   = orphan.get("is_dir", False)
+
+    if not sec or not path:
+        return None
+
+    # Determine method from file type
+    ext = os.path.splitext(filename)[1].lower()
+    if ext == ".zip":
+        method = "zip"
+    elif is_dir or ext == "":
+        method = "copy_with_files"
+    else:
+        method = "copy"
+
+    # Store archive_path relative to repo root
+    try:
+        rel_path = os.path.relpath(path, get_repo_root())
+    except Exception:
+        rel_path = path  # fallback to absolute
+
+    # Label: strip extension for cleaner display
+    label = os.path.splitext(filename)[0] if not is_dir else filename
+
+    record = {
+        "label":          label,
+        "source_path":    "",          # no source — archive only
+        "archive_path":   rel_path,
+        "archive_method": method,
+        "archive_date":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "date_added":     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "category":       sec,
+        "notes":          "Imported from orphan scan",
+    }
+
+    data = load_manifest()
+    data["sections"][sec].append(record)
+    save_manifest(data)
+    _safe_log("Orphan imported to manifest [{0}]: {1}".format(sec, filename))
+    return record
+
+
+def scan_untracked_archive_files():
+    """
+    Scan all section archive directories for files that are present on disk
+    but NOT referenced by any manifest record.  Unlike orphan scan (which is
+    used for clean-up), this is used on Refresh to auto-import files that
+    were manually copied into the repository directory via Windows Explorer.
+
+    Returns list of dicts identical to scan_orphaned_archive_files().
+    Re-uses that function internally.
+    """
+    return scan_orphaned_archive_files()
+
+
 def run_health_check():
     """
     Full health check including orphaned archive file scan.

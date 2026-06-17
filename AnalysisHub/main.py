@@ -599,13 +599,19 @@ class HealthCheckDialog(WinForms.Form):
         self._btn_del_orphan.Enabled = bool(orphans)
         self.Controls.Add(self._btn_del_orphan)
 
+        self._btn_import_orphan = _make_btn(
+            u"\u2795  Add to Repository", 224, y, 180, 28,
+            primary=True, handler=self._on_import_orphan)
+        self._btn_import_orphan.Enabled = bool(orphans)
+        self.Controls.Add(self._btn_import_orphan)
+
         lbl_hint = WinForms.Label()
-        lbl_hint.Text = ("Select a row and click Delete to remove from disk, "
-                         "or close to ignore.")
+        lbl_hint.Text = ("Select a row, then Delete to remove from disk "
+                         "or Add to Repository to track it in the hub.")
         lbl_hint.Font      = _FONT_SMALL
         lbl_hint.ForeColor = Drawing.Color.Gray
-        lbl_hint.Location  = Drawing.Point(224, y + 6)
-        lbl_hint.Size      = Drawing.Size(520, 18)
+        lbl_hint.Location  = Drawing.Point(412, y + 6)
+        lbl_hint.Size      = Drawing.Size(340, 18)
         self.Controls.Add(lbl_hint)
         self._lv_orphans.SelectedIndexChanged += self._on_orphan_sel
         y += 38
@@ -618,7 +624,96 @@ class HealthCheckDialog(WinForms.Form):
         self._btn_relink.Enabled = (self._lv_missing.SelectedItems.Count == 1)
 
     def _on_orphan_sel(self, s, e):
-        self._btn_del_orphan.Enabled = (self._lv_orphans.SelectedItems.Count == 1)
+        has_sel = (self._lv_orphans.SelectedItems.Count == 1)
+        self._btn_del_orphan.Enabled    = has_sel
+        self._btn_import_orphan.Enabled = has_sel
+
+    def _on_import_orphan(self, s, e):
+        """Add the selected orphaned archive file to the manifest."""
+        try:
+            if self._lv_orphans.SelectedItems.Count != 1:
+                return
+            sel_item = self._lv_orphans.SelectedItems[0]
+            try:
+                idx = int(sel_item.Tag)
+            except (TypeError, ValueError):
+                idx = sel_item.Index
+            if idx < 0 or idx >= len(self._orphan_data):
+                return
+            orphan = self._orphan_data[idx]
+
+            # Let user choose which section to add it to
+            sec_labels = [repo.SECTION_LABELS.get(s, s) for s in repo.ALL_SECTIONS]
+            default_sec = orphan.get("section", repo.ALL_SECTIONS[0])
+            default_idx = (repo.ALL_SECTIONS.index(default_sec)
+                           if default_sec in repo.ALL_SECTIONS else 0)
+
+            dlg_sec = WinForms.Form()
+            dlg_sec.Text          = u"Add to Repository \u2014 Choose Section"
+            dlg_sec.Width         = 420
+            dlg_sec.Height        = 200
+            dlg_sec.StartPosition = WinForms.FormStartPosition.CenterParent
+            dlg_sec.MinimizeBox   = False
+            dlg_sec.MaximizeBox   = False
+            dlg_sec.BackColor     = Drawing.Color.White
+            dlg_sec.Font          = _FONT_NORMAL
+
+            lbl2 = WinForms.Label()
+            lbl2.Text     = (u"Add \"{0}\" to which section?".format(
+                orphan.get("filename", "")))
+            lbl2.Location = Drawing.Point(16, 14)
+            lbl2.Size     = Drawing.Size(380, 36)
+            dlg_sec.Controls.Add(lbl2)
+
+            cb = WinForms.ComboBox()
+            cb.DropDownStyle = WinForms.ComboBoxStyle.DropDownList
+            cb.Location      = Drawing.Point(16, 56)
+            cb.Size          = Drawing.Size(375, 24)
+            for lbl3 in sec_labels:
+                cb.Items.Add(lbl3)
+            cb.SelectedIndex = default_idx
+            dlg_sec.Controls.Add(cb)
+
+            chosen_section = [default_sec]
+
+            def _ok_import(s2, e2):
+                chosen_section[0] = repo.ALL_SECTIONS[cb.SelectedIndex]
+                dlg_sec.DialogResult = WinForms.DialogResult.OK
+                dlg_sec.Close()
+
+            def _cancel_import(s2, e2):
+                dlg_sec.DialogResult = WinForms.DialogResult.Cancel
+                dlg_sec.Close()
+
+            dlg_sec.Controls.Add(_make_btn("Add", 220, 110, 80, 30,
+                                           primary=True, handler=_ok_import))
+            dlg_sec.Controls.Add(_make_btn("Cancel", 308, 110, 80, 30,
+                                           handler=_cancel_import))
+
+            if dlg_sec.ShowDialog() != WinForms.DialogResult.OK:
+                return
+
+            # Patch the orphan's section before importing
+            orphan_copy = dict(orphan)
+            orphan_copy["section"] = chosen_section[0]
+            record = repo.add_orphan_to_manifest(orphan_copy)
+            if record is None:
+                WinForms.MessageBox.Show("Import failed.", "Error")
+                return
+
+            # Update the list item visually
+            sel_item.ForeColor = _CLR_ARCHIVED_OK
+            sel_item.SubItems[0].Text = repo.SECTION_LABELS.get(
+                chosen_section[0], chosen_section[0])
+            sel_item.SubItems[1].Text += u"  \u2714 added"
+            self._orphan_data.pop(idx)
+            self._btn_del_orphan.Enabled    = False
+            self._btn_import_orphan.Enabled = False
+            _log("Orphan imported: {0} -> {1}".format(
+                orphan.get("filename"), chosen_section[0]))
+        except Exception as exc:
+            _log("Import orphan error: " + str(exc))
+            WinForms.MessageBox.Show("Import failed:\n" + str(exc), "Error")
 
     def _on_relink(self, s, e):
         try:
@@ -1798,6 +1893,29 @@ class RepositoryForm(WinForms.Form):
     def _refresh_all(self, sender, e):
         try:
             _log("Refresh all sections")
+
+            # ── Auto-import files manually copied into the repository dir ────
+            # Scan archive subdirectories for files not in the manifest and
+            # silently add them so they appear in the correct tab.
+            try:
+                untracked = repo.scan_untracked_archive_files()
+                if untracked:
+                    for u in untracked:
+                        repo.add_orphan_to_manifest(u)
+                    _log("Auto-imported {0} manually copied file(s)".format(
+                        len(untracked)))
+                    WinForms.MessageBox.Show(
+                        u"{0} file(s) found in the repository directory that "
+                        u"were not in the manifest.\n\n"
+                        u"They have been added as Archived \u2714 records. "
+                        u"Use right-click \u2192 Relink to connect them to "
+                        u"a source file if one exists.".format(len(untracked)),
+                        u"New Files Detected",
+                        WinForms.MessageBoxButtons.OK,
+                        WinForms.MessageBoxIcon.Information)
+            except Exception as ui_exc:
+                _log("Untracked scan error: " + str(ui_exc))
+
             for sec in repo.ALL_SECTIONS:
                 records = repo.get_section_records(sec)
                 self._section_data[sec] = records
@@ -1879,6 +1997,18 @@ class RepositoryForm(WinForms.Form):
     def _current_lv(self):
         return self._listviews.get(self._cur_section)
 
+    def _record_by_manifest_index(self, section, manifest_index):
+        """
+        Look up a display record from _section_data by its manifest_index field.
+        This is safe after sorting because manifest_index is injected by
+        get_section_records() and is stable regardless of display order.
+        Returns the record dict, or None if not found.
+        """
+        for rec in self._section_data.get(section, []):
+            if rec.get("manifest_index") == manifest_index:
+                return rec
+        return None
+
     def _selected_records(self):
         """
         Return list of (manifest_index, record) for selected rows.
@@ -1918,7 +2048,9 @@ class RepositoryForm(WinForms.Form):
             arch_abs = record.get("archive_path_abs", "")
             missing  = (repo.ARCH_STATUS_MISSING in status and not arch_abs)
             outdated = repo.ARCH_STATUS_OUTDATED in status
-            src_path = record.get("source_path", "")
+            src_path = record.get("source_path_abs", "") or record.get("source_path", "")
+            # Relink available for: MISSING files AND archive-only records (no source)
+            has_arch_no_src = bool(arch_abs) and not bool(src_path)
 
             menu = WinForms.ContextMenuStrip()
 
@@ -1948,8 +2080,10 @@ class RepositoryForm(WinForms.Form):
 
             menu.Items.Add(WinForms.ToolStripSeparator())
 
-            item_relink = menu.Items.Add(u"\u27A1  Relink Missing File\u2026")
-            item_relink.Enabled = missing
+            item_relink = menu.Items.Add(
+                u"\u27A1  Connect to Source File\u2026" if has_arch_no_src
+                else u"\u27A1  Relink Missing File\u2026")
+            item_relink.Enabled = missing or has_arch_no_src
             _idx = idx
             _sec = sec
             item_relink.Click += lambda s2, e2: self._on_relink(_sec, _idx)
@@ -1992,19 +2126,19 @@ class RepositoryForm(WinForms.Form):
         except Exception as exc:
             _log("Context menu error: " + str(exc))
 
-    def _on_link_source_wbpj(self, section, index):
+    def _on_link_source_wbpj(self, section, manifest_index):
         """Option B: let user browse to the .wbpj that was archived to produce this .wbpz."""
         try:
-            records = self._section_data.get(section, [])
-            if index < 0 or index >= len(records):
+            record = self._record_by_manifest_index(section, manifest_index)
+            if record is None:
                 return
-            label = records[index].get("label", "")
+            label = record.get("label", "")
             dlg = WinForms.OpenFileDialog()
             dlg.Title  = u"Link source .wbpj for \"{0}\"".format(label)
             dlg.Filter = "Workbench Projects (*.wbpj)|*.wbpj|All Files (*.*)|*.*"
             if dlg.ShowDialog() != WinForms.DialogResult.OK:
                 return
-            repo.link_source_wbpj(section, index, dlg.FileName)
+            repo.link_source_wbpj(section, manifest_index, dlg.FileName)
             self._refresh_all(None, None)
             self._set_status(
                 u"Source project linked: {0}".format(
@@ -2149,23 +2283,23 @@ class RepositoryForm(WinForms.Form):
     def _on_double_click(self, sender, e):
         self._on_open(sender, e)
 
-    def _on_archive_single(self, section, index):
+    def _on_archive_single(self, section, manifest_index):
         """Fix 6: open ArchiveDialog pre-filtered to a single record."""
         try:
-            # Guard: in_user_files records are Local — no archiving needed
-            records = self._section_data.get(section, [])
-            if 0 <= index < len(records):
-                if records[index].get("in_user_files"):
-                    WinForms.MessageBox.Show(
-                        u"This file is a Local reference inside the project "
-                        u"directory and does not need to be archived.",
-                        u"Local File \u2014 No Archive Needed",
-                        WinForms.MessageBoxButtons.OK,
-                        WinForms.MessageBoxIcon.Information)
-                    return
+            # Guard: in_user_files records are Local - no archiving needed.
+            # Use manifest_index lookup (safe after sorting).
+            record = self._record_by_manifest_index(section, manifest_index)
+            if record and record.get("in_user_files"):
+                WinForms.MessageBox.Show(
+                    u"This file is a Local reference inside the project "
+                    u"directory and does not need to be archived.",
+                    u"Local File \u2014 No Archive Needed",
+                    WinForms.MessageBoxButtons.OK,
+                    WinForms.MessageBoxIcon.Information)
+                return
             open_proj  = _get_open_project_path()
             candidates = repo.get_archive_candidates(
-                open_proj, only_section=section, only_index=index)
+                open_proj, only_section=section, only_index=manifest_index)
             if not candidates:
                 WinForms.MessageBox.Show(
                     "This file has no source path and cannot be archived "
@@ -2204,13 +2338,13 @@ class RepositoryForm(WinForms.Form):
             _log("launch_archive_dialog error: " + traceback.format_exc())
             WinForms.MessageBox.Show("Archive error:\n" + str(exc), "Error")
 
-    def _on_rearchive(self, section, index):
+    def _on_rearchive(self, section, manifest_index):
         try:
-            records = self._section_data.get(section, [])
-            if index < 0 or index >= len(records):
+            record = self._record_by_manifest_index(section, manifest_index)
+            if record is None:
                 return
-            record = records[index]
-            src    = record.get("source_path", "")
+            index  = manifest_index   # helpers use manifest_index directly
+            src    = record.get("source_path_abs", "") or record.get("source_path", "")
             label  = record.get("label", "")
             method = record.get("archive_method", "copy")
 
@@ -2266,12 +2400,12 @@ class RepositoryForm(WinForms.Form):
             _log("Re-archive error: " + str(exc))
             WinForms.MessageBox.Show("Re-archive failed:\n" + str(exc), "Error")
 
-    def _on_relink(self, section, index):
+    def _on_relink(self, section, manifest_index):
         try:
-            records  = self._section_data.get(section, [])
-            if index < 0 or index >= len(records):
+            record   = self._record_by_manifest_index(section, manifest_index)
+            if record is None:
                 return
-            old_path = records[index].get("source_path", "")
+            old_path = record.get("source_path_abs", "") or record.get("source_path", "")
             old_name = os.path.basename(old_path) if old_path else ""
             dlg = WinForms.OpenFileDialog()
             dlg.Title    = u"Relink: locate \"{0}\"".format(old_name)
@@ -2279,7 +2413,7 @@ class RepositoryForm(WinForms.Form):
             dlg.FileName = old_name
             if dlg.ShowDialog() != WinForms.DialogResult.OK:
                 return
-            repo.relink_file_record(section, index, dlg.FileName)
+            repo.relink_file_record(section, manifest_index, dlg.FileName)
             self._refresh_all(None, None)
             self._set_status(
                 u"Relinked: {0}".format(os.path.basename(dlg.FileName)))
